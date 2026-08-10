@@ -1,0 +1,41 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: translator-backend
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mounts the models directory from the host to the container.
+      # This allows modifying or changing the model without rebuilding the image.
+      - ./backend/models:/app/models
+    environment:
+      - MODEL_PATH=/app/models/nllb_int8
+      - TOKENIZER_PATH=/app/models/nllb_int8/sentencepiece.bpe.model
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        # Vite bakes environment variables at build-time.
+        # This tells the React app to communicate with the backend on port 8000 of the host machine.
+        - VITE_API_URL=http://localhost:8000
+    container_name: translator-frontend
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+    restart: unless-stopped

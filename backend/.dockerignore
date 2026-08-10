@@ -1,0 +1,8 @@
+env_nllb_backend/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+models/nllb_int8/*.dll
+*.log
