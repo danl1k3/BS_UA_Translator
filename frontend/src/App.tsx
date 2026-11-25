@@ -1,5 +1,8 @@
 import { useState, useRef } from 'react';
 import TextTranslator from './components/TextTranslator';
+import InferenceStatusBadge from './components/InferenceStatusBadge';
+import { useHealth } from './hooks/useHealth';
+import type { InferenceStatus } from './hooks/useHealth';
 import { API_BASE } from './config';
 
 // --- ТИПІЗАЦІЯ ---
@@ -10,7 +13,11 @@ export interface TranslatorProps {
   isLoading: boolean;
   error: string | null;
   clearOutput: () => void;
+  inferenceStatus: InferenceStatus;
 }
+
+// --- Timeout for inference requests (ms) ---
+const TRANSLATE_TIMEOUT_MS = 55_000; // Heroku 55s idle limit
 
 // --- ХУК ДЛЯ ПЕРЕКЛАДУ (SSE) ---
 const useTranslate = () => {
@@ -29,6 +36,15 @@ const useTranslate = () => {
     setOutput("");
     setError(null);
 
+    // Set a timeout to abort if inference takes too long
+    const timeoutId = setTimeout(() => {
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+        setError("Час очікування вичерпано. Модель може прокидатися — спробуйте ще раз через хвилину.");
+        setIsLoading(false);
+      }
+    }, TRANSLATE_TIMEOUT_MS);
+
     try {
       const response = await fetch(`${API_BASE}/translate/stream`, {
         method: "POST",
@@ -40,6 +56,14 @@ const useTranslate = () => {
         }),
         signal: abortControllerRef.current.signal,
       });
+
+      if (response.status === 429) {
+        const data = await response.json().catch(() => null);
+        setError(data?.detail || "Занадто багато запитів. Зачекайте трохи.");
+        setIsLoading(false);
+        clearTimeout(timeoutId);
+        return;
+      }
 
       if (!response.ok) throw new Error("Помилка з'єднання з сервером");
 
@@ -64,9 +88,19 @@ const useTranslate = () => {
           const trimmedLine = line.trim();
           if (!trimmedLine) continue;
 
+          if (trimmedLine.startsWith("event: error")) {
+            // Next data line will contain the error
+            continue;
+          }
+
           if (trimmedLine.startsWith("data: ")) {
             const content = trimmedLine.replace("data: ", "").trim();
             if (content === "[DONE]") {
+              setIsLoading(false);
+              continue;
+            }
+            if (content === "Translation failed") {
+              setError("Переклад не вдався. Спробуйте ще раз.");
               setIsLoading(false);
               continue;
             }
@@ -76,11 +110,16 @@ const useTranslate = () => {
         }
       }
     } catch (err: unknown) {
-      if (!(err instanceof Error && err.name === 'AbortError')) {
+      if (err instanceof Error && err.name === 'AbortError') {
+        // If error was already set by the timeout handler, don't overwrite
+        if (!error) {
+          // User cancelled
+        }
+      } else {
         setError(err instanceof Error ? err.message : "Невідома помилка");
-        setIsLoading(false);
       }
     } finally {
+      clearTimeout(timeoutId);
       setIsLoading(false);
     }
   };
@@ -92,6 +131,7 @@ const useTranslate = () => {
 export default function App() {
   const [currentPage, setCurrentPage] = useState<string>('translator');
   const { translate, output, isLoading, error, setOutput } = useTranslate();
+  const { stats, inferenceStatus } = useHealth(8000);
 
   const commonProps: TranslatorProps = {
     setPage: setCurrentPage,
@@ -99,7 +139,8 @@ export default function App() {
     output,
     isLoading,
     error,
-    clearOutput: () => setOutput("")
+    clearOutput: () => setOutput(""),
+    inferenceStatus,
   };
 
   const renderContent = () => {
@@ -135,6 +176,7 @@ export default function App() {
           </div>
           <span className="text-xl font-bold tracking-tight text-slate-800">BalkanTranslate</span>
         </div>
+        <InferenceStatusBadge status={inferenceStatus} eta={stats?.eta_seconds} />
       </nav>
 
       <main className="max-w-6xl mx-auto px-6 pb-20">

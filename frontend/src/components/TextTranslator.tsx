@@ -1,9 +1,9 @@
 import { useState } from 'react';
-import { ArrowLeftRight, Copy, Check, Loader2 } from 'lucide-react';
+import { ArrowLeftRight, Copy, Check, Loader2, AlertTriangle } from 'lucide-react';
 import type { TranslatorProps } from '../App';
 import FileUploader from './FileUploader';
 
-export default function TextTranslator({ translate, output, isLoading, error: propError, clearOutput }: TranslatorProps) {
+export default function TextTranslator({ translate, output, isLoading, error: propError, clearOutput, inferenceStatus }: TranslatorProps) {
   const [sourceText, setSourceText] = useState('');
   const [copied, setCopied] = useState(false);
   const [direction, setDirection] = useState('balkan_to_ua');
@@ -11,18 +11,24 @@ export default function TextTranslator({ translate, output, isLoading, error: pr
   
   const MAX_CHARS = 2000;
 
+  const isWakingUp = inferenceStatus === 'waking_up';
+  const isUnavailable = inferenceStatus === 'unavailable';
+
   // Викликає функцію перекладу, що приходить з пропсів
   const handleTranslate = async () => {
     if (!sourceText.trim()) return;
     setLocalError(null);
 
+    if (isUnavailable) {
+      setLocalError('Сервіс тимчасово недоступний. Зачекайте або спробуйте пізніше.');
+      return;
+    }
+
     const isBalkanSource = direction === 'balkan_to_ua';
-    // Map UI directions to model language codes expected by backend
     const sourceLang = isBalkanSource ? 'bos_Latn' : 'ukr_Cyrl';
     const targetLang = isBalkanSource ? 'ukr_Cyrl' : 'bos_Latn';
 
     try {
-      // clear previous output before starting a new translation
       clearOutput();
       await translate(sourceText, sourceLang, targetLang);
     } catch (err: unknown) {
@@ -72,6 +78,16 @@ export default function TextTranslator({ translate, output, isLoading, error: pr
           <span className="hidden sm:block text-[10px] font-mono text-slate-400 uppercase tracking-[0.2em]">Neural Engine v1.0</span>
         </div>
 
+        {/* Waking up banner */}
+        {isWakingUp && (
+          <div className="flex items-center gap-2 px-4 py-2.5 bg-amber-50 border-b border-amber-100 text-amber-700 text-sm">
+            <AlertTriangle className="w-4 h-4 flex-shrink-0" />
+            <span>
+              Модель прокидається після сну. Перший запит може зайняти 30–60 секунд.
+            </span>
+          </div>
+        )}
+
         {/* Content Area */}
         <div className="flex flex-col lg:flex-row flex-grow divide-y lg:divide-y-0 lg:divide-x divide-slate-100">
           {/* Input Section */}
@@ -84,7 +100,12 @@ export default function TextTranslator({ translate, output, isLoading, error: pr
             />
             <div className="p-4 flex justify-between items-center text-xs text-slate-400 font-mono">
               <span>{sourceText.length} / {MAX_CHARS}</span>
-              {displayError && <span className="text-rose-500 font-sans">{displayError}</span>}
+              {displayError && (
+                <span className="text-rose-500 font-sans flex items-center gap-1 max-w-[60%] text-right">
+                  <AlertTriangle className="w-3 h-3 flex-shrink-0" />
+                  {displayError}
+                </span>
+              )}
             </div>
           </div>
           
@@ -127,14 +148,23 @@ export default function TextTranslator({ translate, output, isLoading, error: pr
           
           <button
             onClick={handleTranslate}
-            disabled={!sourceText.trim() || isLoading}
+            disabled={!sourceText.trim() || isLoading || isUnavailable}
             className="w-full sm:w-auto px-8 py-4 bg-indigo-600 hover:bg-indigo-700 text-white rounded-2xl font-bold text-lg shadow-lg shadow-indigo-100 transition-all active:scale-95 disabled:opacity-50 flex items-center justify-center gap-2"
           >
-            {isLoading ? <Loader2 className="w-5 h-5 animate-spin" /> : "Перекласти зараз"}
+            {isLoading ? (
+              <>
+                <Loader2 className="w-5 h-5 animate-spin" />
+                {isWakingUp ? 'Прокидається...' : 'Перекладає...'}
+              </>
+            ) : isUnavailable ? (
+              'Сервіс недоступний'
+            ) : (
+              "Перекласти зараз"
+            )}
           </button>
         </div>
       </div>
-        <FileUploader sourceLang={sourceLangCode} targetLang={targetLangCode} />
+        <FileUploader sourceLang={sourceLangCode} targetLang={targetLangCode} inferenceStatus={inferenceStatus} />
       </div>
   );
 }

@@ -1,14 +1,18 @@
 import React, { useState, useRef } from 'react';
-import { Loader2, UploadCloud, FileText, CheckCircle2, AlertCircle } from 'lucide-react';
+import { Loader2, UploadCloud, FileText, CheckCircle2, AlertCircle, AlertTriangle } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { API_BASE } from '../config';
+import type { InferenceStatus } from '../hooks/useHealth';
 
 interface Props {
   sourceLang: string;
   targetLang: string;
+  inferenceStatus: InferenceStatus;
 }
 
-export default function FileUploader({ sourceLang, targetLang }: Props) {
+const FILE_UPLOAD_TIMEOUT_MS = 300_000; // 5 minutes for file translation
+
+export default function FileUploader({ sourceLang, targetLang, inferenceStatus }: Props) {
   const [file, setFile] = useState<File | null>(null);
   const [uploading, setUploading] = useState(false);
   const [messages, setMessages] = useState<string[]>([]);
@@ -19,6 +23,9 @@ export default function FileUploader({ sourceLang, targetLang }: Props) {
   const [jobId, setJobId] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const isUnavailable = inferenceStatus === 'unavailable';
 
   const onDrop = (e: React.DragEvent) => {
     e.preventDefault();
@@ -47,8 +54,23 @@ export default function FileUploader({ sourceLang, targetLang }: Props) {
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
 
+  const cleanup = () => {
+    setUploading(false);
+    abortRef.current = null;
+    if (timeoutRef.current) {
+      clearTimeout(timeoutRef.current);
+      timeoutRef.current = null;
+    }
+  };
+
   const handleUpload = async () => {
     if (!file) return;
+
+    if (isUnavailable) {
+      appendMsg('Error: Сервіс тимчасово недоступний. Спробуйте пізніше.');
+      return;
+    }
+
     setUploading(true);
     setMessages([]);
     setProgress(null);
@@ -56,6 +78,15 @@ export default function FileUploader({ sourceLang, targetLang }: Props) {
 
     const form = new FormData();
     form.append('upload_file', file, file.name);
+
+    // Set a timeout for the entire file upload operation
+    timeoutRef.current = setTimeout(() => {
+      if (abortRef.current) {
+        abortRef.current.abort();
+        appendMsg('Error: Час очікування вичерпано. Файл занадто великий або модель недоступна.');
+        cleanup();
+      }
+    }, FILE_UPLOAD_TIMEOUT_MS);
 
     try {
       const backendUrl = `${API_BASE}/translate/file/stream?source_lang=${encodeURIComponent(sourceLang)}&target_lang=${encodeURIComponent(targetLang)}&debug=${DEBUG}`;
@@ -67,10 +98,17 @@ export default function FileUploader({ sourceLang, targetLang }: Props) {
         signal: controller.signal,
       });
 
+      if (resp.status === 429) {
+        const data = await resp.json().catch(() => null);
+        appendMsg('Error: ' + (data?.detail || 'Занадто багато запитів. Зачекайте трохи.'));
+        cleanup();
+        return;
+      }
+
       if (!resp.ok || !resp.body) {
         const txt = await resp.text();
-        appendMsg('Server error: ' + txt);
-        setUploading(false);
+        appendMsg('Error: ' + txt);
+        cleanup();
         return;
       }
 
@@ -115,13 +153,7 @@ export default function FileUploader({ sourceLang, targetLang }: Props) {
               if (p.data && typeof p.data === 'string' && DEBUG) {
                 appendMsg(p.data);
               }
-              
-              if (p.status === 'done' && !DEBUG) {
-                // Optional: log only when a chunk is fully done to keep logs clean
-                // appendMsg(`Оброблено чанк ${p.paragraph}:${p.chunk}`);
-              }
             } catch {
-              // Regex fallback for non-JSON or malformed data
               const match = data.match(/(\d+)\s*\/\s*(\d+)/);
               if (match) {
                 setProgress({ current: parseInt(match[1]), total: parseInt(match[2]) });
@@ -130,7 +162,6 @@ export default function FileUploader({ sourceLang, targetLang }: Props) {
             }
           } else if (event === 'processing') {
             appendMsg(data);
-            // If data contains "done" or similar, we might want to set progress to 100
           } else if (event === 'complete') {
             setProgress({ current: 100, total: 100 });
             appendMsg('Збірка файлу завершена!');
@@ -173,21 +204,20 @@ export default function FileUploader({ sourceLang, targetLang }: Props) {
                 appendMsg('Complete');
               }
             }
-            setUploading(false);
+            cleanup();
           } else if (event === 'error') {
             appendMsg('Error: ' + data);
-            setUploading(false);
+            cleanup();
           }
         }
       }
       if (buf.trim()) appendMsg(buf.trim());
     } catch (e: unknown) {
       if (!(e instanceof Error && e.name === 'AbortError')) {
-        appendMsg('Upload failed: ' + (e instanceof Error ? e.message : String(e)));
+        appendMsg('Error: ' + (e instanceof Error ? e.message : String(e)));
       }
     } finally {
-      setUploading(false);
-      abortRef.current = null;
+      cleanup();
     }
   };
 
@@ -221,7 +251,7 @@ export default function FileUploader({ sourceLang, targetLang }: Props) {
         onDragOver={(e) => e.preventDefault()}
         className={`mt-6 p-8 border-2 border-dashed rounded-3xl text-center transition-all duration-300 ${
           file ? 'border-indigo-300 bg-indigo-50/30' : 'border-slate-200 bg-white'
-        }`}
+        } ${isUnavailable ? 'opacity-60' : ''}`}
       >
         <div className="flex flex-col items-center gap-4">
           <div className={`p-4 rounded-2xl ${file ? 'bg-indigo-100 text-indigo-600' : 'bg-slate-100 text-slate-400'}`}>
@@ -274,14 +304,14 @@ export default function FileUploader({ sourceLang, targetLang }: Props) {
                   <button 
                     onClick={handleUpload} 
                     className="px-6 py-2.5 bg-indigo-600 text-white rounded-xl font-bold hover:bg-indigo-700 transition-all shadow-lg shadow-indigo-100 disabled:opacity-50 disabled:shadow-none"
-                    disabled={!file}
+                    disabled={!file || isUnavailable}
                   >
-                    Перекласти
+                    {isUnavailable ? 'Сервіс недоступний' : 'Перекласти'}
                   </button>
                 </>
               ) : (
                 <button 
-                  onClick={() => { if (abortRef.current) abortRef.current.abort(); setUploading(false); }} 
+                  onClick={() => { if (abortRef.current) abortRef.current.abort(); cleanup(); }} 
                   className="px-6 py-2.5 bg-rose-50 text-rose-700 border border-rose-100 rounded-xl font-bold hover:bg-rose-100 transition-colors"
                 >
                   Скасувати
