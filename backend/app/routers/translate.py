@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
 from ..http_utils import make_content_disposition_header
+from ..job_store import JobStatus
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -76,9 +77,86 @@ async def translate_stream(request: TranslationRequest, raw_request: Request):
     return EventSourceResponse(event_generator())
 
 
+@router.post("/translate/file/submit")
+async def submit_file_job(
+    upload_file: UploadFile,
+    request: Request,
+    source_lang: str = "bos_Latn",
+    target_lang: str = "ukr_Cyrl",
+):
+    """Submit a file for async translation. Returns immediately with a job_id.
+
+    Use GET /translate/file/status?job_id=... to poll progress,
+    then GET /translate/file/result?job_id=... to download the result.
+    Required for Heroku's 30-second first-byte limit on long file jobs.
+    """
+    if not upload_file:
+        raise HTTPException(status_code=400, detail="No file uploaded")
+
+    raw_bytes = await _read_and_validate_upload(upload_file, request)
+    inmem = _InMemoryUpload(upload_file.filename, upload_file.content_type, raw_bytes)
+    file_manager = request.app.state.file_manager
+    job_store = request.app.state.job_store
+
+    import asyncio
+
+    job = job_store.create_job()
+
+    async def _run_job():
+        try:
+            translated = await file_manager.process_upload(inmem, source_lang, target_lang)
+            base, ext = os.path.splitext(upload_file.filename or "translated")
+            translated_filename = f"{base}_translated{ext}"
+            is_binary = isinstance(translated, (bytes, bytearray))
+            content_type = (
+                upload_file.content_type or ("application/octet-stream" if is_binary else "text/plain")
+            )
+            job_store.set_complete(job.job_id, translated, translated_filename, content_type)
+        except Exception:
+            logger.exception("Async file job %s failed", job.job_id)
+            job_store.set_failed(job.job_id, "Translation failed")
+
+    task = asyncio.create_task(_run_job())
+    job_store.register_task(job.job_id, task)
+    job_store.set_running(job.job_id, total_chunks=0)
+
+    return {"job_id": job.job_id, "status": "pending"}
+
+
+@router.get("/translate/file/status")
+async def get_file_job_status(job_id: str, request: Request):
+    """Poll the status and progress of an async file translation job."""
+    job_store = request.app.state.job_store
+    status = job_store.status_dict(job_id)
+    if status["status"] == "not_found":
+        raise HTTPException(status_code=404, detail="Job not found")
+    return status
+
+
 @router.get("/translate/file/result")
 async def get_translated_file(job_id: str, request: Request):
     """Return stored translated file for given job_id."""
+    # Try the new job store first
+    job_store = request.app.state.job_store
+    job = job_store.get_job(job_id)
+    if job is not None:
+        if job.status == JobStatus.RUNNING or job.status == JobStatus.PENDING:
+            raise HTTPException(status_code=202, detail="Job still in progress")
+        if job.status == JobStatus.FAILED:
+            raise HTTPException(status_code=500, detail=job.error or "Translation failed")
+        data = job_store.get_result_data(job_id)
+        if data is None:
+            raise HTTPException(status_code=404, detail="Result not found")
+        filename = job.result_filename or f"result_{job_id}"
+        content_type = job.result_content_type or "application/octet-stream"
+        headers = make_content_disposition_header(filename)
+        if isinstance(data, (bytes, bytearray)):
+            return StreamingResponse(io.BytesIO(data), media_type=content_type, headers=headers)
+        return StreamingResponse(
+            io.StringIO(data), media_type=content_type, headers=headers
+        )
+
+    # Fallback: legacy in-memory results from FileTranslationManager
     file_manager = request.app.state.file_manager
     res = file_manager.fetch_result(job_id)
     if not res:

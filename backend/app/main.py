@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from .backends import RemoteBackend, TranslatorBackend
 from .config import Settings
 from .file_translator import FileTranslationManager
+from .job_store import JobStore
 from .monitor import HealthChecker
 from .queue_manager import TranslationQueueManager
 from .rate_limiter import RateLimitMiddleware
@@ -42,11 +43,16 @@ def _wire_dependencies(
         result_ttl_seconds=cfg.result_ttl_seconds,
         max_stored_results=cfg.max_stored_results,
     )
+    job_store = JobStore(
+        result_ttl_seconds=cfg.result_ttl_seconds,
+        max_jobs=cfg.max_stored_results * 2,
+    )
     app.state.settings = cfg
     app.state.backend = active_backend
     app.state.health_checker = health_checker
     app.state.queue_manager = queue_manager
     app.state.file_manager = file_manager
+    app.state.job_store = job_store
 
 
 def create_app(
