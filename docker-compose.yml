@@ -10,6 +10,12 @@ services:
       - REMOTE_INFERENCE_URL=${REMOTE_INFERENCE_URL:-https://your-space.hf.space}
       - REMOTE_API_TOKEN=${REMOTE_API_TOKEN:-}
       - PYTHONUNBUFFERED=1
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     restart: unless-stopped
 
   frontend:
@@ -18,7 +24,14 @@ services:
       dockerfile: Dockerfile
     container_name: translator-frontend
     ports:
-      - "80:80"
+      - "80:8080"
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
     restart: unless-stopped

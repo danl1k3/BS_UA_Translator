@@ -3,33 +3,31 @@ FROM node:20-alpine AS build
 
 WORKDIR /app
 
-# Copy dependency definitions
 COPY package.json package-lock.json ./
+RUN npm ci --legacy-peer-deps
 
-# Install dependencies
-RUN npm install --legacy-peer-deps
-
-# Copy application source
 COPY . .
 
-# Environment variable arg for API URL during build (Vite bakes env vars at build time)
 ARG VITE_API_URL
 ENV VITE_API_URL=${VITE_API_URL}
 
-# Build the production bundle
 RUN npm run build
 
-# Stage 2: Serve using Nginx
-FROM nginx:alpine
+# Stage 2: Serve using Nginx (non-root)
+FROM nginx:1.27-alpine
 
-# Copy built assets from Stage 1
 COPY --from=build /app/dist /usr/share/nginx/html
-
-# Copy custom Nginx routing configuration
 COPY nginx.conf /etc/nginx/conf.d/default.conf
 
-# Expose HTTP port
-EXPOSE 80
+RUN chown -R nginx:nginx /usr/share/nginx/html /var/cache/nginx /var/log/nginx /etc/nginx/conf.d \
+    && touch /tmp/nginx.pid \
+    && chown nginx:nginx /tmp/nginx.pid
 
-# Start Nginx
-CMD ["nginx", "-g", "daemon off;"]
+EXPOSE 8080
+
+USER nginx
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+    CMD wget -qO- http://127.0.0.1:8080/ || exit 1
+
+CMD ["nginx", "-g", "daemon off; pid /tmp/nginx.pid;"]
