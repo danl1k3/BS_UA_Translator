@@ -1,5 +1,6 @@
-import React, { useState, useRef } from 'react';
+import { useState, useRef } from 'react';
 import TextTranslator from './components/TextTranslator';
+import { API_BASE } from './config';
 
 // --- ТИПІЗАЦІЯ ---
 export interface TranslatorProps {
@@ -29,8 +30,7 @@ const useTranslate = () => {
     setError(null);
 
     try {
-      const apiBaseUrl = import.meta.env.VITE_API_URL || "http://localhost:8000";
-      const response = await fetch(`${apiBaseUrl}/translate/stream`, {
+      const response = await fetch(`${API_BASE}/translate/stream`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -75,8 +75,8 @@ const useTranslate = () => {
           }
         }
       }
-    } catch (err: any) {
-      if (err.name !== 'AbortError') {
+    } catch (err: unknown) {
+      if (!(err instanceof Error && err.name === 'AbortError')) {
         setError(err instanceof Error ? err.message : "Невідома помилка");
         setIsLoading(false);
       }

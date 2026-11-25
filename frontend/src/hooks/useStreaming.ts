@@ -1,4 +1,5 @@
 import { useState, useRef, useCallback } from 'react';
+import { API_BASE } from '../config';
 
 type Device = 'cuda' | 'cpu' | 'unknown';
 
@@ -19,7 +20,7 @@ export function useStreaming() {
     setDevice('unknown');
 
     try {
-      const resp = await fetch('/translate/stream', {
+      const resp = await fetch(`${API_BASE}/translate/stream`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ text, source_lang: sourceLang, target_lang: targetLang }),
@@ -41,14 +42,12 @@ export function useStreaming() {
         if (done) break;
         buffer += decoder.decode(value, { stream: true });
 
-        // Split by SSE newline sequences
         const parts = buffer.split('\n');
         buffer = parts.pop() || '';
 
         for (const part of parts) {
           const line = part.trim();
           if (!line) continue;
-          // Expecting lines like: data: {"text":"..."}
           if (line.startsWith('data:')) {
             const payload = line.replace(/^data:\s*/, '');
             if (payload === '[DONE]') {
@@ -56,26 +55,23 @@ export function useStreaming() {
               continue;
             }
             try {
-              // Try parse JSON, fallback to raw
-              const p = JSON.parse(payload);
+              const p = JSON.parse(payload) as { text?: string; device?: string };
               if (p.text) {
-                setChunks((c) => [...c, p.text]);
+                setChunks((c) => [...c, p.text!]);
               }
               if (p.device) setDevice(p.device === 'cuda' ? 'cuda' : 'cpu');
             } catch {
               setChunks((c) => [...c, payload]);
             }
           } else {
-            // fallback plain text
             setChunks((c) => [...c, line]);
           }
         }
       }
 
-      // append remaining buffer
       if (buffer) setChunks((c) => [...c, buffer]);
-    } catch (err) {
-      if ((err as any)?.name === 'AbortError') {
+    } catch (err: unknown) {
+      if (err instanceof Error && err.name === 'AbortError') {
         // aborted by user
       } else {
         console.error('Streaming error', err);

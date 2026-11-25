@@ -1,6 +1,7 @@
 import React, { useState, useRef } from 'react';
 import { Loader2, UploadCloud, FileText, CheckCircle2, AlertCircle } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
+import { API_BASE } from '../config';
 
 interface Props {
   sourceLang: string;
@@ -57,8 +58,7 @@ export default function FileUploader({ sourceLang, targetLang }: Props) {
     form.append('upload_file', file, file.name);
 
     try {
-      const apiBaseUrl = import.meta.env.VITE_API_URL || "http://localhost:8000";
-      const backendUrl = `${apiBaseUrl}/translate/file/stream?source_lang=${encodeURIComponent(sourceLang)}&target_lang=${encodeURIComponent(targetLang)}&debug=${DEBUG}`;
+      const backendUrl = `${API_BASE}/translate/file/stream?source_lang=${encodeURIComponent(sourceLang)}&target_lang=${encodeURIComponent(targetLang)}&debug=${DEBUG}`;
       const controller = new AbortController();
       abortRef.current = controller;
       const resp = await fetch(backendUrl, {
@@ -83,7 +83,7 @@ export default function FileUploader({ sourceLang, targetLang }: Props) {
         if (done) break;
         buf += decoder.decode(value, { stream: true });
 
-        let parts = buf.split(/\r?\n\r?\n/);
+        const parts = buf.split(/\r?\n\r?\n/);
         buf = parts.pop() || '';
 
         for (const rawMsg of parts) {
@@ -120,7 +120,7 @@ export default function FileUploader({ sourceLang, targetLang }: Props) {
                 // Optional: log only when a chunk is fully done to keep logs clean
                 // appendMsg(`Оброблено чанк ${p.paragraph}:${p.chunk}`);
               }
-            } catch (e) {
+            } catch {
               // Regex fallback for non-JSON or malformed data
               const match = data.match(/(\d+)\s*\/\s*(\d+)/);
               if (match) {
@@ -169,7 +169,7 @@ export default function FileUploader({ sourceLang, targetLang }: Props) {
                   setJobId(obj.job_id);
                   appendMsg('Translation complete');
                 }
-              } catch (e) {
+              } catch {
                 appendMsg('Complete');
               }
             }
@@ -181,9 +181,9 @@ export default function FileUploader({ sourceLang, targetLang }: Props) {
         }
       }
       if (buf.trim()) appendMsg(buf.trim());
-    } catch (e: any) {
-      if (e.name !== 'AbortError') {
-        appendMsg('Upload failed: ' + (e.message || String(e)));
+    } catch (e: unknown) {
+      if (!(e instanceof Error && e.name === 'AbortError')) {
+        appendMsg('Upload failed: ' + (e instanceof Error ? e.message : String(e)));
       }
     } finally {
       setUploading(false);
@@ -193,8 +193,7 @@ export default function FileUploader({ sourceLang, targetLang }: Props) {
 
   const fetchResultAndDownload = async (id: string) => {
     try {
-      const apiBaseUrl = import.meta.env.VITE_API_URL || "http://localhost:8000";
-      const url = `${apiBaseUrl}/translate/file/result?job_id=${encodeURIComponent(id)}`;
+      const url = `${API_BASE}/translate/file/result?job_id=${encodeURIComponent(id)}`;
       const res = await fetch(url);
       if (!res.ok) {
         const t = await res.text();
@@ -208,8 +207,8 @@ export default function FileUploader({ sourceLang, targetLang }: Props) {
       const blob = await res.blob();
       downloadBlob(blob, filename, res.headers.get('Content-Type') || undefined);
       appendMsg('Downloaded: ' + filename);
-    } catch (e: any) {
-      appendMsg('Download failed: ' + (e.message || String(e)));
+    } catch (e: unknown) {
+      appendMsg('Download failed: ' + (e instanceof Error ? e.message : String(e)));
     }
   };
 

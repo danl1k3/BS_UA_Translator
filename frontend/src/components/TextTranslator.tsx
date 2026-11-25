@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { ArrowLeftRight, Copy, Download, ThumbsUp, ThumbsDown, Check, Loader2 } from 'lucide-react';
+import { ArrowLeftRight, Copy, Check, Loader2 } from 'lucide-react';
 import type { TranslatorProps } from '../App';
 import FileUploader from './FileUploader';
 
@@ -25,7 +25,7 @@ export default function TextTranslator({ translate, output, isLoading, error: pr
       // clear previous output before starting a new translation
       clearOutput();
       await translate(sourceText, sourceLang, targetLang);
-    } catch (err: any) {
+    } catch (err: unknown) {
       setLocalError(err instanceof Error ? err.message : 'Невідома помилка');
     }
   };
@@ -40,17 +40,6 @@ export default function TextTranslator({ translate, output, isLoading, error: pr
     navigator.clipboard.writeText(output).catch(() => {});
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
-  };
-
-  const handleDownload = () => {
-    if (!output) return;
-    const blob = new Blob([output], { type: 'text/plain' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = 'translation.txt';
-    a.click();
-    URL.revokeObjectURL(url);
   };
 
   const isBalkanSource = direction === 'balkan_to_ua';
