@@ -27,6 +27,11 @@ class Settings(BaseSettings):
     result_ttl_seconds: int = 3600
     max_stored_results: int = 100
 
+    # Rate limiting
+    rate_limit_rpm: int = 20  # requests per minute per key
+    rate_limit_burst: int = 5
+    cookie_secret: str = "change-me-in-production"
+
     @field_validator("cors_origins", mode="before")
     @classmethod
     def _parse_cors_origins(cls, v: object) -> list[str]:

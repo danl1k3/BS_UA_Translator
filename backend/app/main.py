@@ -9,6 +9,7 @@ from .config import Settings
 from .file_translator import FileTranslationManager
 from .monitor import HealthChecker
 from .queue_manager import TranslationQueueManager
+from .rate_limiter import RateLimitMiddleware
 from .routers.health import router as health_router
 from .routers.translate import router as translate_router
 
@@ -68,6 +69,12 @@ def create_app(
         allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
+    )
+    app.add_middleware(
+        RateLimitMiddleware,
+        requests_per_minute=cfg.rate_limit_rpm,
+        burst=cfg.rate_limit_burst,
+        cookie_secret=cfg.cookie_secret,
     )
 
     if backend is not None:
