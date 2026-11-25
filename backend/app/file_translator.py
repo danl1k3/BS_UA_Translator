@@ -1,80 +1,114 @@
 import asyncio
+import base64
+import io
+import logging
 import os
 import re
-import io
-import base64
-from typing import List, Tuple, AsyncGenerator
-from fastapi import UploadFile
+import time
+from typing import AsyncGenerator, List, Tuple
+
 from docx import Document as DocxDocument
+from fastapi import UploadFile
+
+from .backends import TranslatorBackend
+
+logger = logging.getLogger(__name__)
 
 
 class FileTranslationManager:
-    """
-    Менеджер для перекладу завантажених файлів.
-    Алгоритм (спрощено):
-    - читає файл (текст/plain або HTML)
-    - розбиває на параграфи
-    - розбиває параграфи на речення (через NLLBTranslator._split_into_sentences)
-    - групує речення в чанки по символах
-    - відправляє чанки в `queue_manager.stream_translation` і збирає переклад
-    - збирає назад перекладені чанки, зберігаючи розділення на параграфи
-    """
+    """Manages file parsing, chunked concurrent translation, and document reconstruction."""
 
-    def __init__(self, queue_manager, translator, max_chunk_chars: int = 800, concurrency: int = 4):
+    def __init__(
+        self,
+        queue_manager,
+        backend: TranslatorBackend,
+        max_chunk_chars: int = 800,
+        concurrency: int = 4,
+        result_ttl_seconds: int = 3600,
+        max_stored_results: int = 100,
+    ):
         self.queue_manager = queue_manager
-        self.translator = translator
+        self.backend = backend
         self.max_chunk_chars = max_chunk_chars
         self.sema = asyncio.Semaphore(concurrency)
-        # job_id -> {data, content_type, filename, is_binary}
+        self.result_ttl_seconds = result_ttl_seconds
+        self.max_stored_results = max_stored_results
         self._results: dict[str, dict] = {}
 
-    async def process_upload(self, upload_file: UploadFile, source_lang: str, target_lang: str) -> str:
-        raw = await upload_file.read()
-        try:
-            text = raw.decode('utf-8')
-        except Exception:
-            # fallback: latin-1
-            text = raw.decode('latin-1')
+    def _cleanup_results(self) -> None:
+        """Evict expired results and enforce max_stored_results cap."""
+        now = time.monotonic()
+        expired = [
+            k
+            for k, v in self._results.items()
+            if now - v.get("created_at", 0) > self.result_ttl_seconds
+        ]
+        for k in expired:
+            self._results.pop(k, None)
 
-        filename = (upload_file.filename or '').lower()
-        # Support docx
-        if filename.endswith('.docx') or (upload_file.content_type and 'word' in (upload_file.content_type or '')):
-            # parse docx preserving paragraph-level and run-level styles
-            bio = io.BytesIO(raw)
-            doc = DocxDocument(bio)
-            paragraphs = []
-            para_meta = []
-            para_runs = []
+        while len(self._results) > self.max_stored_results:
+            oldest_key = min(
+                self._results, key=lambda k: self._results[k].get("created_at", 0)
+            )
+            self._results.pop(oldest_key, None)
+
+    def _store_result(self, job_id: str, entry: dict) -> None:
+        self._cleanup_results()
+        entry["created_at"] = time.monotonic()
+        self._results[job_id] = entry
+        self._cleanup_results()
+
+    def fetch_result(self, job_id: str):
+        """Return stored result by job_id if present and not expired, else None."""
+        self._cleanup_results()
+        return self._results.get(job_id)
+
+    def _extract_document_parts(
+        self, raw: bytes, filename: str | None, content_type: str | None
+    ) -> tuple[list[str], list[dict], list[list[dict]], bool, bool]:
+        lower_name = (filename or "").lower()
+        is_docx = lower_name.endswith(".docx") or (
+            bool(content_type) and "word" in (content_type or "").lower()
+        )
+        if is_docx:
+            doc = DocxDocument(io.BytesIO(raw))
+            paragraphs: list[str] = []
+            para_meta: list[dict] = []
+            para_runs: list[list[dict]] = []
             for p in doc.paragraphs:
-                paragraphs.append(p.text or '')
-                # store style name to preserve later
-                style_name = None
+                paragraphs.append(p.text or "")
                 try:
                     style_name = p.style.name
                 except Exception:
                     style_name = None
-                para_meta.append({'style': style_name})
+                para_meta.append({"style": style_name})
+                para_runs.append(
+                    [
+                        {
+                            "text": r.text or "",
+                            "bold": bool(r.bold),
+                            "italic": bool(r.italic),
+                            "underline": bool(r.underline),
+                        }
+                        for r in p.runs
+                    ]
+                )
+            return paragraphs, para_meta, para_runs, True, False
 
-                runs = []
-                for r in p.runs:
-                    runs.append({
-                        'text': r.text or '',
-                        'bold': bool(r.bold),
-                        'italic': bool(r.italic),
-                        'underline': bool(r.underline),
-                    })
-                para_runs.append(runs)
-            is_html = False
-        else:
-            paragraphs, is_html = self._split_into_paragraphs(text, upload_file.content_type)
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            text = raw.decode("latin-1")
+        paragraphs, is_html = self._split_into_paragraphs(text, content_type)
+        return paragraphs, [], [], False, is_html
 
-        # Prepare chunks: list of (para_idx, chunk_idx, chunk_text)
+    def _build_chunks(self, paragraphs: list[str]) -> List[Tuple[int, int, str]]:
         chunks: List[Tuple[int, int, str]] = []
         for p_idx, para in enumerate(paragraphs):
-            sentences = self.translator._split_into_sentences(para)
+            sentences = self.backend.split_into_sentences(para)
             if not sentences:
                 continue
-            cur = []
+            cur: list[str] = []
             cur_len = 0
             c_idx = 0
             for s in sentences:
@@ -86,176 +120,191 @@ class FileTranslationManager:
                 else:
                     cur.append(s)
                     cur_len += len(s) + 1
-
             if cur:
                 chunks.append((p_idx, c_idx, " ".join(cur)))
+        return chunks
 
-        # Translate chunks concurrently but limited by semaphore
-        translated_chunks = {}
+    @staticmethod
+    def _reconstruct_paragraphs(
+        paragraphs_count: int,
+        chunks: List[Tuple[int, int, str]],
+        translated_chunks: dict[Tuple[int, int], str],
+    ) -> list[str]:
+        para_map: dict[int, list[tuple[int, str]]] = {}
+        for p_idx, c_idx, _ in chunks:
+            para_map.setdefault(p_idx, []).append(
+                (c_idx, translated_chunks.get((p_idx, c_idx), ""))
+            )
 
-        async def translate_and_store(par_idx: int, ch_idx: int, chunk_text: str):
-            async with self.sema:
-                # queue_manager.stream_translation returns AsyncGenerator
-                collected = []
-                async for piece in self.queue_manager.stream_translation(chunk_text, target_lang, source_lang):
-                    collected.append(piece)
-                translated_chunks[(par_idx, ch_idx)] = "".join(collected).strip()
+        reconstructed: list[str] = []
+        for p_idx in range(paragraphs_count):
+            items = sorted(para_map.get(p_idx, []), key=lambda x: x[0])
+            joined = " ".join(txt for _, txt in items).strip()
+            reconstructed.append(joined)
+        return reconstructed
 
-        tasks = [asyncio.create_task(translate_and_store(p, c, t)) for (p, c, t) in chunks]
-        if tasks:
-            await asyncio.gather(*tasks)
+    def _build_docx_bytes(
+        self,
+        raw: bytes,
+        reconstructed: list[str],
+        para_meta: list[dict],
+        para_runs: list[list[dict]],
+        apply_heading_bold: bool = False,
+    ) -> bytes:
+        try:
+            orig_doc = DocxDocument(io.BytesIO(raw))
+        except Exception:
+            new_doc = DocxDocument()
+            for para_text in reconstructed:
+                new_doc.add_paragraph(para_text)
+            out = io.BytesIO()
+            new_doc.save(out)
+            return out.getvalue()
 
-        # Reconstruct paragraphs from translated chunks
-        para_map = {}
-        for (p_idx, c_idx, _text) in chunks:
-            para_map.setdefault(p_idx, []).append((c_idx, translated_chunks.get((p_idx, c_idx), "")))
+        for idx, para_text in enumerate(reconstructed):
+            runs_meta = para_runs[idx] if idx < len(para_runs) else None
+            p = (
+                orig_doc.paragraphs[idx]
+                if idx < len(orig_doc.paragraphs)
+                else orig_doc.add_paragraph()
+            )
+            style_name = para_meta[idx].get("style") if idx < len(para_meta) else None
+            is_heading = False
+            if apply_heading_bold and isinstance(style_name, str):
+                sn = style_name.lower()
+                is_heading = sn.startswith("heading") or "title" in sn or "header" in sn
 
-        reconstructed = []
-        for p_idx in range(len(paragraphs)):
-            parts = []
-            items = para_map.get(p_idx, [])
-            items.sort(key=lambda x: x[0])
-            for _, txt in items:
-                parts.append(txt)
-            reconstructed.append("\n\n".join([p for p in (" ".join(parts).strip(),) if p]))
-
-        if filename.endswith('.docx'):
-            # Update the original docx in-place to preserve relationships, images, styles.
-            bio = io.BytesIO(raw)
-            try:
-                orig_doc = DocxDocument(bio)
-            except Exception:
-                # fallback: build a new doc if original cannot be opened
-                new_doc = DocxDocument()
-                for para_text in reconstructed:
-                    new_doc.add_paragraph(para_text)
-                out = io.BytesIO()
-                new_doc.save(out)
-                out.seek(0)
-                return out.getvalue()
-
-            # Iterate paragraphs and replace run texts keeping formatting
-            for idx, para_text in enumerate(reconstructed):
-                runs_meta = para_runs[idx] if 'para_runs' in locals() and idx < len(para_runs) else None
-                p = orig_doc.paragraphs[idx] if idx < len(orig_doc.paragraphs) else orig_doc.add_paragraph()
-                if runs_meta and any(r.get('text') for r in runs_meta):
-                    allocated = self._distribute_to_runs(para_text, runs_meta)
-                    # ensure we have enough runs in the original paragraph
-                    # if not, extend with new runs
-                    while len(p.runs) < len(allocated):
-                        p.add_run('')
-                    for i, run_meta in enumerate(runs_meta):
-                        text_piece = allocated[i] if i < len(allocated) else ''
+            if runs_meta and any(r.get("text") for r in runs_meta):
+                allocated = self._distribute_to_runs(para_text, runs_meta)
+                while len(p.runs) < len(allocated):
+                    p.add_run("")
+                for i, run_meta in enumerate(runs_meta):
+                    text_piece = allocated[i] if i < len(allocated) else ""
+                    try:
+                        p.runs[i].text = text_piece
+                        p.runs[i].bold = (
+                            bool(run_meta.get("bold")) or is_heading
+                            if apply_heading_bold
+                            else run_meta.get("bold")
+                        )
+                        p.runs[i].italic = run_meta.get("italic")
+                        p.runs[i].underline = run_meta.get("underline")
+                    except Exception:
                         try:
                             p.runs[i].text = text_piece
-                            p.runs[i].bold = run_meta.get('bold')
-                            p.runs[i].italic = run_meta.get('italic')
-                            p.runs[i].underline = run_meta.get('underline')
                         except Exception:
-                            try:
-                                p.runs[i].text = text_piece
-                            except Exception:
-                                pass
-                else:
-                    # fallback: set paragraph text by replacing runs
-                    if p.runs:
-                        # put all text into first run and clear others
-                        try:
-                            p.runs[0].text = para_text
-                            for r in p.runs[1:]:
-                                r.text = ''
-                        except Exception:
-                            p.text = para_text
-                    else:
+                            pass
+            else:
+                if p.runs:
+                    try:
+                        p.runs[0].text = para_text
+                        for r in p.runs[1:]:
+                            r.text = ""
+                    except Exception:
                         p.text = para_text
+                else:
+                    p.text = para_text
 
-                # apply paragraph style if available
+            if style_name:
                 try:
-                    if 'para_meta' in locals() and idx < len(para_meta):
-                        style_name = para_meta[idx].get('style')
-                        if style_name:
-                            p.style = style_name
+                    p.style = style_name
                 except Exception:
                     pass
 
-            out = io.BytesIO()
-            orig_doc.save(out)
-            out.seek(0)
-            return out.getvalue()
+        out = io.BytesIO()
+        orig_doc.save(out)
+        return out.getvalue()
 
+    async def process_upload(
+        self, upload_file: UploadFile, source_lang: str, target_lang: str
+    ) -> str | bytes:
+        raw = await upload_file.read()
+        paragraphs, para_meta, para_runs, is_docx, is_html = self._extract_document_parts(
+            raw, upload_file.filename, upload_file.content_type
+        )
+        chunks = self._build_chunks(paragraphs)
+        translated_chunks: dict[Tuple[int, int], str] = {}
+
+        async def translate_and_store(par_idx: int, ch_idx: int, chunk_text: str):
+            async with self.sema:
+                collected = []
+                async for piece in self.queue_manager.stream_translation(
+                    chunk_text, target_lang, source_lang
+                ):
+                    collected.append(piece)
+                translated_chunks[(par_idx, ch_idx)] = "".join(collected).strip()
+
+        tasks = [
+            asyncio.create_task(translate_and_store(p, c, t)) for (p, c, t) in chunks
+        ]
+        try:
+            if tasks:
+                await asyncio.gather(*tasks)
+        except BaseException:
+            for t in tasks:
+                t.cancel()
+            raise
+
+        reconstructed = self._reconstruct_paragraphs(
+            len(paragraphs), chunks, translated_chunks
+        )
+
+        if is_docx:
+            return self._build_docx_bytes(raw, reconstructed, para_meta, para_runs)
         if is_html:
-            # If original was html, wrap translated paragraphs with <p> tags
-            html = "\n".join(f"<p>{self._escape_html(p)}</p>" for p in reconstructed)
-            return html
-
+            return "\n".join(f"<p>{self._escape_html(p)}</p>" for p in reconstructed)
         return "\n\n".join(reconstructed)
 
-    def _split_into_paragraphs(self, text: str, content_type: str):
-        # crude detection for html
+    def _split_into_paragraphs(self, text: str, content_type: str | None):
         is_html = False
-        if content_type and 'html' in content_type.lower():
+        if content_type and "html" in content_type.lower():
             is_html = True
-            # find <p>...</p> blocks
-            paras = re.findall(r'<p[^>]*>(.*?)</p>', text, flags=re.S | re.I)
+            paras = re.findall(r"<p[^>]*>(.*?)</p>", text, flags=re.S | re.I)
             if paras:
-                # strip tags inside paragraphs
                 cleaned = [self._strip_tags(p).strip() for p in paras if p.strip()]
                 return cleaned, is_html
-            # fallback: remove tags and treat whole body
-            body = re.sub(r'<[^>]+>', '', text)
-            parts = re.split(r'\n\s*\n', body)
+            body = re.sub(r"<[^>]+>", "", text)
+            parts = re.split(r"\n\s*\n", body)
             return [p.strip() for p in parts if p.strip()], is_html
 
-        # plain text: split by blank lines
-        parts = re.split(r'\n\s*\n', text)
+        parts = re.split(r"\n\s*\n", text)
         return [p.strip() for p in parts if p.strip()], is_html
 
     @staticmethod
     def _strip_tags(html: str) -> str:
-        return re.sub(r'<[^>]+>', '', html)
+        return re.sub(r"<[^>]+>", "", html)
 
     @staticmethod
     def _escape_html(text: str) -> str:
-        return (text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;'))
+        return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
     def _distribute_to_runs(self, translated: str, runs_meta: List[dict]) -> List[str]:
-        """Distribute translated paragraph text into runs according to original run lengths,
-        preserving word boundaries."""
-        total_orig = sum(len(r.get('text', '')) for r in runs_meta)
+        """Distribute translated paragraph text into runs preserving word boundaries."""
+        total_orig = sum(len(r.get("text", "")) for r in runs_meta)
         num_runs = len(runs_meta)
         if total_orig == 0 or num_runs == 0:
-            return [translated] + [''] * (num_runs - 1)
+            return [translated] + [""] * max(0, num_runs - 1)
 
-        # compute cumulative target boundaries in the translated string
         tlen = len(translated)
-        boundaries = []
+        boundaries: list[float] = []
         acc_orig = 0
-        for i in range(num_runs):
-            orig_len = len(runs_meta[i].get('text', ''))
-            acc_orig += orig_len
+        for run in runs_meta:
+            acc_orig += len(run.get("text", ""))
             boundaries.append((acc_orig / total_orig) * tlen)
-        
-        # ensure the last boundary is exactly tlen
+
         if boundaries:
             boundaries[-1] = tlen
 
-        # Split into tokens (words and whitespaces) to avoid breaking words
-        tokens = re.split(r'(\s+)', translated)
-        tokens = [t for t in tokens if t]
-
-        allocated = [''] * num_runs
+        tokens = [t for t in re.split(r"(\s+)", translated) if t]
+        allocated = [""] * num_runs
         curr_pos = 0
         for token in tokens:
             midpoint = curr_pos + len(token) / 2
-            # Find which run this token belongs to based on its midpoint
-            assigned_run = 0
+            assigned_run = num_runs - 1
             for i in range(num_runs):
                 if midpoint <= boundaries[i]:
                     assigned_run = i
                     break
-            else:
-                assigned_run = num_runs - 1
-            
             allocated[assigned_run] += token
             curr_pos += len(token)
 
@@ -263,117 +312,92 @@ class FileTranslationManager:
 
     def _translated_filename(self, filename: str | None) -> str:
         if not filename:
-            return 'translated'
+            return "translated"
         base, ext = os.path.splitext(filename)
         if not ext:
             return f"{base}_translated"
         return f"{base}_translated{ext}"
 
-    async def process_upload_stream(self, upload_file: UploadFile, source_lang: str, target_lang: str, job_id: str | None = None, debug: bool = True) -> AsyncGenerator[dict, None]:
-        """Async generator that yields progress events during file translation.
-        Emits dicts with keys: event (progress|chunk|complete|error), data (str or base64), paragraph, chunk
-        """
+    async def process_upload_stream(
+        self,
+        upload_file: UploadFile,
+        source_lang: str,
+        target_lang: str,
+        job_id: str | None = None,
+        debug: bool = False,
+    ) -> AsyncGenerator[dict, None]:
+        """Async generator yielding progress and completion events during file translation."""
         raw = await upload_file.read()
-        try:
-            text = raw.decode('utf-8')
-        except Exception:
-            text = raw.decode('latin-1')
-
-        filename = (upload_file.filename or '').lower()
-        is_docx = filename.endswith('.docx') or (upload_file.content_type and 'word' in (upload_file.content_type or ''))
-
-        if is_docx:
-            bio = io.BytesIO(raw)
-            doc = DocxDocument(bio)
-            paragraphs = [p.text or '' for p in doc.paragraphs]
-            para_meta = []
-            para_runs = []
-            for p in doc.paragraphs:
-                try:
-                    style_name = p.style.name
-                except Exception:
-                    style_name = None
-                para_meta.append({'style': style_name})
-                runs = []
-                for r in p.runs:
-                    runs.append({
-                        'text': r.text or '',
-                        'bold': bool(r.bold),
-                        'italic': bool(r.italic),
-                        'underline': bool(r.underline),
-                    })
-                para_runs.append(runs)
-        else:
-            paragraphs, _ = self._split_into_paragraphs(text, upload_file.content_type)
-
-        chunks: List[Tuple[int, int, str]] = []
-        for p_idx, para in enumerate(paragraphs):
-            sentences = self.translator._split_into_sentences(para)
-            if not sentences:
-                continue
-            cur = []
-            cur_len = 0
-            c_idx = 0
-            for s in sentences:
-                if cur_len + len(s) + 1 > self.max_chunk_chars and cur:
-                    chunks.append((p_idx, c_idx, " ".join(cur)))
-                    c_idx += 1
-                    cur = [s]
-                    cur_len = len(s)
-                else:
-                    cur.append(s)
-                    cur_len += len(s) + 1
-            if cur:
-                chunks.append((p_idx, c_idx, " ".join(cur)))
+        paragraphs, para_meta, para_runs, is_docx, _ = self._extract_document_parts(
+            raw, upload_file.filename, upload_file.content_type
+        )
+        chunks = self._build_chunks(paragraphs)
+        translated_fn = self._translated_filename(upload_file.filename)
 
         if not chunks:
-            # yield complete immediately if nothing to translate
-            yield {'event': 'complete', 'job_id': job_id, 'filename': self._translated_filename(upload_file.filename), 'content_type': upload_file.content_type}
+            yield {
+                "event": "complete",
+                "job_id": job_id,
+                "filename": translated_fn,
+                "content_type": upload_file.content_type,
+            }
             return
 
-        translated_chunks = {}
+        translated_chunks: dict[Tuple[int, int], str] = {}
         total_chunks = len(chunks)
         completed_chunks = 0
-        event_queue = asyncio.Queue()
+        event_queue: asyncio.Queue[dict | None] = asyncio.Queue()
 
         async def translate_task(p_idx: int, c_idx: int, chunk_text: str):
             nonlocal completed_chunks
             try:
                 async with self.sema:
                     collected = []
-                    async for piece in self.queue_manager.stream_translation(chunk_text, target_lang, source_lang):
+                    async for piece in self.queue_manager.stream_translation(
+                        chunk_text, target_lang, source_lang
+                    ):
                         collected.append(piece)
-                        # current progress: how many chunks already fully done
-                        await event_queue.put({
-                            'event': 'progress',
-                            'paragraph': p_idx,
-                            'chunk': c_idx,
-                            'data': piece,
-                            'current': completed_chunks,
-                            'total': total_chunks
-                        })
+                        await event_queue.put(
+                            {
+                                "event": "progress",
+                                "paragraph": p_idx,
+                                "chunk": c_idx,
+                                "data": piece,
+                                "current": completed_chunks,
+                                "total": total_chunks,
+                            }
+                        )
                     translated_chunks[(p_idx, c_idx)] = "".join(collected).strip()
                     completed_chunks += 1
-                    # chunk finished event
-                    await event_queue.put({
-                        'event': 'progress',
-                        'paragraph': p_idx,
-                        'chunk': c_idx,
-                        'current': completed_chunks,
-                        'total': total_chunks,
-                        'status': 'done'
-                    })
-            except Exception as e:
-                await event_queue.put({'event': 'error', 'data': f"Chunk {p_idx}:{c_idx} error: {str(e)}"})
+                    await event_queue.put(
+                        {
+                            "event": "progress",
+                            "paragraph": p_idx,
+                            "chunk": c_idx,
+                            "current": completed_chunks,
+                            "total": total_chunks,
+                            "status": "done",
+                        }
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Chunk %s:%s translation failed", p_idx, c_idx)
+                await event_queue.put(
+                    {"event": "error", "data": "File translation failed"}
+                )
+                raise
 
-        # Start all tasks concurrently (semaphore within will limit active execution)
         tasks = [asyncio.create_task(translate_task(p, c, t)) for (p, c, t) in chunks]
 
         async def monitor_tasks():
-            await asyncio.gather(*tasks, return_exceptions=True)
-            await event_queue.put(None) # end of events
+            try:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            finally:
+                await event_queue.put(None)
 
-        asyncio.create_task(monitor_tasks())
+        monitor_task = asyncio.create_task(monitor_tasks())
+        had_error = False
 
         try:
             while True:
@@ -381,132 +405,91 @@ class FileTranslationManager:
                 if ev is None:
                     break
                 yield ev
-                if ev.get('event') == 'error':
-                    # optional: cancel other tasks on first error
-                    # for t in tasks: t.cancel()
-                    pass
-        except asyncio.CancelledError:
-            for t in tasks: t.cancel()
-            raise
+                if ev.get("event") == "error":
+                    had_error = True
+                    for t in tasks:
+                        t.cancel()
+                    break
+        finally:
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            if not monitor_task.done():
+                monitor_task.cancel()
+            await asyncio.gather(*tasks, monitor_task, return_exceptions=True)
 
-        # Reconstruction logic
+        if had_error:
+            return
+
         try:
-            yield {'event': 'processing', 'data': 'Збираємо перекладений документ...'}
-            para_map = {}
-            for (p_idx, c_idx, _text) in chunks:
-                para_map.setdefault(p_idx, []).append((c_idx, translated_chunks.get((p_idx, c_idx), "")))
-
-            reconstructed = []
-            for p_idx in range(len(paragraphs)):
-                parts = []
-                items = para_map.get(p_idx, [])
-                items.sort(key=lambda x: x[0])
-                for _, txt in items:
-                    parts.append(txt)
-                reconstructed.append("\n\n".join([p for p in (" ".join(parts).strip(),) if p]))
+            yield {"event": "processing", "data": "Збираємо перекладений документ..."}
+            reconstructed = self._reconstruct_paragraphs(
+                len(paragraphs), chunks, translated_chunks
+            )
 
             if is_docx:
-                bio = io.BytesIO(raw)
-                try:
-                    orig_doc = DocxDocument(bio)
-                except Exception:
-                    new_doc = DocxDocument()
-                    for para_text in reconstructed:
-                        new_doc.add_paragraph(para_text)
-                    out = io.BytesIO()
-                    new_doc.save(out)
-                    out.seek(0)
-                    data_bytes = out.read()
-                    if debug:
-                        translated_filename = self._translated_filename(upload_file.filename)
-                        b64 = base64.b64encode(data_bytes).decode('ascii')
-                        yield {'event': 'complete', 'filename': translated_filename, 'content_type': upload_file.content_type, 'data': b64}
-                    else:
-                        if job_id:
-                            self._results[job_id] = {
-                                'data': data_bytes,
-                                'content_type': upload_file.content_type or 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-                                'filename': self._translated_filename(upload_file.filename),
-                                'is_binary': True,
-                            }
-                        yield {'event': 'complete', 'job_id': job_id, 'filename': self._translated_filename(upload_file.filename), 'content_type': upload_file.content_type}
-                    return
-
-                for idx, para_text in enumerate(reconstructed):
-                    runs_meta = para_runs[idx] if 'para_runs' in locals() and idx < len(para_runs) else None
-                    p = orig_doc.paragraphs[idx] if idx < len(orig_doc.paragraphs) else orig_doc.add_paragraph()
-                    if runs_meta and any(r.get('text') for r in runs_meta):
-                        allocated = self._distribute_to_runs(para_text, runs_meta)
-                        while len(p.runs) < len(allocated):
-                            p.add_run('')
-                        for i, meta in enumerate(runs_meta):
-                            text_piece = allocated[i] if i < len(allocated) else ''
-                            try:
-                                p.runs[i].text = text_piece
-                                try:
-                                    style_name = para_meta[idx].get('style') if 'para_meta' in locals() and idx < len(para_meta) else None
-                                    is_heading = False
-                                    if style_name and isinstance(style_name, str):
-                                        sn = style_name.lower()
-                                        if sn.startswith('heading') or 'title' in sn or 'header' in sn:
-                                            is_heading = True
-                                except Exception:
-                                    is_heading = False
-
-                                bold_val = bool(meta.get('bold')) or is_heading
-                                p.runs[i].bold = bold_val
-                                p.runs[i].italic = meta.get('italic')
-                                p.runs[i].underline = meta.get('underline')
-                            except Exception:
-                                try:
-                                    p.runs[i].text = text_piece
-                                except Exception:
-                                    pass
-                    else:
-                        if p.runs:
-                            try:
-                                p.runs[0].text = para_text
-                                for r in p.runs[1:]:
-                                    r.text = ''
-                            except Exception:
-                                p.text = para_text
-                        else:
-                            p.text = para_text
-
-                out = io.BytesIO()
-                orig_doc.save(out)
-                out.seek(0)
-                data_bytes = out.read()
+                data_bytes = self._build_docx_bytes(
+                    raw,
+                    reconstructed,
+                    para_meta,
+                    para_runs,
+                    apply_heading_bold=True,
+                )
+                content_type = (
+                    upload_file.content_type
+                    or "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                )
                 if debug:
-                    translated_filename = self._translated_filename(upload_file.filename)
-                    b64 = base64.b64encode(data_bytes).decode('ascii')
-                    yield {'event': 'complete', 'filename': translated_filename, 'content_type': upload_file.content_type, 'data': b64}
+                    b64 = base64.b64encode(data_bytes).decode("ascii")
+                    yield {
+                        "event": "complete",
+                        "filename": translated_fn,
+                        "content_type": upload_file.content_type,
+                        "data": b64,
+                    }
                 else:
                     if job_id:
-                        self._results[job_id] = {
-                            'data': data_bytes,
-                            'content_type': upload_file.content_type or 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-                            'filename': self._translated_filename(upload_file.filename),
-                            'is_binary': True,
-                        }
-                    yield {'event': 'complete', 'job_id': job_id, 'filename': self._translated_filename(upload_file.filename), 'content_type': upload_file.content_type}
+                        self._store_result(
+                            job_id,
+                            {
+                                "data": data_bytes,
+                                "content_type": content_type,
+                                "filename": translated_fn,
+                                "is_binary": True,
+                            },
+                        )
+                    yield {
+                        "event": "complete",
+                        "job_id": job_id,
+                        "filename": translated_fn,
+                        "content_type": upload_file.content_type,
+                    }
             else:
                 final_text = "\n\n".join(reconstructed)
                 if debug:
-                    translated_filename = self._translated_filename(upload_file.filename)
-                    yield {'event': 'complete', 'filename': translated_filename, 'content_type': upload_file.content_type, 'data': final_text}
+                    yield {
+                        "event": "complete",
+                        "filename": translated_fn,
+                        "content_type": upload_file.content_type,
+                        "data": final_text,
+                    }
                 else:
                     if job_id:
-                        self._results[job_id] = {
-                            'data': final_text,
-                            'content_type': upload_file.content_type or 'text/plain',
-                            'filename': self._translated_filename(upload_file.filename),
-                            'is_binary': False,
-                        }
-                    yield {'event': 'complete', 'job_id': job_id, 'filename': self._translated_filename(upload_file.filename), 'content_type': upload_file.content_type}
-        except Exception as e:
-            yield {'event': 'error', 'data': str(e)}
-
-    def fetch_result(self, job_id: str):
-        """Return stored result by job_id or None."""
-        return self._results.get(job_id)
+                        self._store_result(
+                            job_id,
+                            {
+                                "data": final_text,
+                                "content_type": upload_file.content_type or "text/plain",
+                                "filename": translated_fn,
+                                "is_binary": False,
+                            },
+                        )
+                    yield {
+                        "event": "complete",
+                        "job_id": job_id,
+                        "filename": translated_fn,
+                        "content_type": upload_file.content_type,
+                    }
+        except Exception:
+            logger.exception("Error reconstructing translated file")
+            yield {"event": "error", "data": "File reconstruction failed"}
