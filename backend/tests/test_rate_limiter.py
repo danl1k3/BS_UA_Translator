@@ -1,5 +1,3 @@
-import time
-from unittest.mock import patch
 
 from app.rate_limiter import RateLimitStore, _sign, _verify
 
@@ -42,7 +40,6 @@ def test_rate_limit_middleware_returns_429():
     from app.config import Settings
     from app.main import create_app
     from fastapi.testclient import TestClient
-
     from tests.test_endpoints import MockBackend
 
     settings = Settings(rate_limit_rpm=60, rate_limit_burst=2, cookie_secret="test")
@@ -71,7 +68,6 @@ def test_health_endpoint_bypasses_rate_limit():
     from app.config import Settings
     from app.main import create_app
     from fastapi.testclient import TestClient
-
     from tests.test_endpoints import MockBackend
 
     settings = Settings(rate_limit_rpm=60, rate_limit_burst=1, cookie_secret="test")

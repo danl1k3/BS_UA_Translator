@@ -7,7 +7,6 @@ from app.config import Settings
 from app.job_store import JobStatus, JobStore
 from app.main import create_app
 from fastapi.testclient import TestClient
-
 from tests.test_endpoints import MockBackend
 
 

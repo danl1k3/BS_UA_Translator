@@ -9,7 +9,6 @@ import hmac
 import logging
 import time
 import uuid
-from collections import defaultdict
 from typing import Any
 
 from fastapi import Request, Response

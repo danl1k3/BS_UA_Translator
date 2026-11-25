@@ -1,5 +1,5 @@
 import React, { useState, useRef } from 'react';
-import { Loader2, UploadCloud, FileText, CheckCircle2, AlertCircle, AlertTriangle } from 'lucide-react';
+import { Loader2, UploadCloud, FileText, CheckCircle2, AlertCircle } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { API_BASE } from '../config';
 import type { InferenceStatus } from '../hooks/useHealth';
