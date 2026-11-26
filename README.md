@@ -1,6 +1,6 @@
 # BalkanTranslate (BS / SR / ME ↔ UK)
 
-Neural machine translation web application for **Bosnian / Serbian / Montenegrin (`bos_Latn`) ↔ Ukrainian (`ukr_Cyrl`)**, built with **FastAPI**, **React + TypeScript + Tailwind CSS**, and a fine-tuned **NLLB-200-600M-distilled** model converted to **CTranslate2 (int8)**.
+Neural machine translation web application for **Bosnian / Serbian / Montenegrin (`bos_Latn`) ↔ Ukrainian (`ukr_Cyrl`)**, built with **FastAPI**, **React + TypeScript + Tailwind CSS**, and a fine-tuned **NLLB-200-600M-distilled** model hosted on a **Hugging Face ZeroGPU Space**.
 
 > **Live Demo:** `<LIVE_DEMO_URL>` *(deploy gateway to Heroku + inference to Hugging Face Spaces)*
 >
@@ -15,14 +15,15 @@ This branch implements **Option A: Split Services (Gateway + Hosted Inference)**
 ```mermaid
 flowchart LR
     User["Browser (React + Vite)"] -->|SSE / REST| Gateway["FastAPI Gateway (Heroku)"]
-    Gateway -->|HTTP SSE + Bearer Token| HF["HF Space Inference (CTranslate2 NLLB-200)"]
+    Gateway -->|Gradio HTTP API + Bearer Token| HF["HF ZeroGPU Space (Gradio, NLLB-200)"]
 ```
 
-- **Frontend (`frontend/`)**: React 19 + TypeScript + Tailwind CSS. Handles SSE text streaming, drag-and-drop file translation (`.txt`, `.docx`, `.html`), inference cold-start ("Waking up") status badges, and 55s request timeouts.
-- **Gateway (`backend/`)**: Slim FastAPI service (no `torch`, `ctranslate2`, or CUDA dependencies). Provides:
-  - Per-IP + signed-cookie token-bucket rate limiting (`backend/app/rate_limiter.py`).
-  - `TranslatorBackend` abstraction with `RemoteBackend` calling Hugging Face Spaces off the event loop (`backend/app/backends.py`).
-  - Async file-translation jobs (`POST /translate/file/submit`, `GET /translate/file/status`, `GET /translate/file/result`) with TTL cleanup to stay within Heroku's 30s first-byte limit.
+- **Frontend (`frontend/`)**: React 19 + TypeScript + Tailwind CSS. Text translation, file translation (`.txt`, `.docx`, `.html`) with progress, and inference status badges.
+- **Gateway (`backend/`)**: Slim FastAPI service without model dependencies. Provides:
+  - Per-IP rate limiting with a signed anonymous-session cookie.
+  - `TranslatorBackend` abstraction with `GradioBackend` calling the Space.
+  - Batching that keeps requests within the model's token limit and saves GPU quota.
+  - A simple in-process queue for file jobs (submit, poll, download, cancel).
 - **Training & Conversion (`training/`)**: Scripts and requirements for fine-tuning NLLB-200, converting to CTranslate2 (`int8`), and evaluating BLEU/chrF++ scores.
 
 ---
@@ -32,8 +33,8 @@ flowchart LR
 ### 1. Run with Docker Compose
 
 ```bash
-export REMOTE_INFERENCE_URL="https://your-space.hf.space"
-export REMOTE_API_TOKEN="hf_..."   # optional if Space is public
+export REMOTE_INFERENCE_URL="https://danlike-nllb-200-600-endpoint.hf.space"
+export REMOTE_API_TOKEN="hf_..."   # GPU time is charged to this account
 docker compose up --build
 ```
 
@@ -65,16 +66,17 @@ Vite proxies `/translate` and `/health` to `http://localhost:8000` by default (o
 
 ### 3. Deploying to Heroku + Hugging Face Spaces
 
-1. **Hugging Face Space**: Host the CTranslate2 model + tokenizer and expose `/health` and `/translate/stream` (see `training/README.md`).
+1. **Hugging Face Space**: a Gradio ZeroGPU Space with a `/translate` endpoint taking `(text, direction)`, where `direction` is `bs-ua` or `ua-bs` (currently [`Danlike/NLLB-200-600-endpoint`](https://huggingface.co/spaces/Danlike/NLLB-200-600-endpoint)). All visitors share the daily GPU quota of the token owner.
 2. **Heroku Gateway**:
    ```bash
    heroku stack:set container
-   heroku config:set REMOTE_INFERENCE_URL="https://your-space.hf.space"
+   heroku config:set REMOTE_INFERENCE_URL="https://danlike-nllb-200-600-endpoint.hf.space"
    heroku config:set REMOTE_API_TOKEN="hf_..."
    heroku config:set COOKIE_SECRET="$(openssl rand -hex 32)"
    heroku config:set CORS_ORIGINS="https://your-frontend.example.com"
    git push heroku main
    ```
+3. **Frontend**: build with `VITE_API_URL=https://your-gateway.herokuapp.com npm run build` and host `frontend/dist` as a static site; add its origin to `CORS_ORIGINS`.
 
 ---
 
@@ -82,13 +84,12 @@ Vite proxies `/translate` and `/health` to `http://localhost:8000` by default (o
 
 | Method | Endpoint | Description |
 | :--- | :--- | :--- |
-| `GET` | `/health` | Gateway metrics + remote inference reachability (`Normal` / `Waking up`) |
+| `GET` | `/health` | Inference reachability and file queue length |
 | `POST` | `/translate/stream` | Stream text translation via Server-Sent Events (`text`, `source_lang`, `target_lang`) |
-| `POST` | `/translate/file` | Synchronous `.txt`/`.docx`/`.html` translation (returns translated file; `?debug=true` returns ZIP) |
-| `POST` | `/translate/file/stream` | Stream chunk-by-chunk file translation progress via SSE and store result by `job_id` |
-| `POST` | `/translate/file/submit` | Submit async file job and return `job_id` immediately (Heroku 30s limit safe) |
-| `GET` | `/translate/file/status` | Poll async file job status and chunk progress (`?job_id=...`) |
-| `GET` | `/translate/file/result` | Download completed translated file (`?job_id=...`) |
+| `POST` | `/translate/file/submit` | Queue a file (up to 3 MB and 20,000 characters) and return `job_id` |
+| `GET` | `/translate/file/status` | Job status and progress (`?job_id=...`) |
+| `GET` | `/translate/file/result` | Download the translated file (`?job_id=...`) |
+| `DELETE` | `/translate/file/job` | Cancel a queued or running job (`?job_id=...`) |
 
 ---
 
@@ -114,6 +115,7 @@ pytest
 
 # Frontend
 cd frontend
+npm test
 npm run lint
 npm run build
 ```
@@ -123,9 +125,11 @@ npm run build
 ## Limitations
 
 - **Cold Starts:** Free-tier Hugging Face Spaces sleep after inactivity; the first translation may take 30–60 seconds while the model loads.
-- **In-Process State:** Rate-limit buckets and async file job results are stored in memory on a single gateway instance (Redis-backed storage is planned for Phase 3).
-- **Sentence Splitting:** Uses a regex-based splitter; complex abbreviations in Bosnian/Serbian/Croatian may occasionally split mid-sentence.
-- **Text Length:** Single `/translate/stream` requests are capped at `2000` characters; use file upload for longer documents.
+- **GPU Quota:** All visitors share the daily ZeroGPU quota of the token owner.
+- **In-Process State:** Rate-limit buckets, the file queue and results live in memory of a single gateway instance and are lost on restart.
+- **Documents:** `.docx` translation covers body paragraphs only (not tables, headers or footers); `.html` output keeps paragraph text only.
+- **Sentence Splitting:** Regex-based; abbreviations may split mid-sentence. Sentences over 220 characters are cut at a clause or word boundary to fit the model, which can affect quality.
+- **Text Length:** `/translate/stream` requests are capped at 2000 characters; use file upload for longer documents.
 
 ---
 
@@ -133,4 +137,4 @@ npm run build
 
 - **Model Credits:** Built on **NLLB-200** (*No Language Left Behind*) by **Meta AI** (`facebook/nllb-200-distilled-600M`).
 - **Model License:** NLLB-200 weights are released under **CC-BY-NC 4.0** (non-commercial use only). Any fine-tuned derivatives inherit this restriction.
-- **Inference Engine:** [CTranslate2](https://github.com/OpenNMT/CTranslate2) (`int8` quantization).
+- **Inference:** Hugging Face ZeroGPU Space (Gradio, PyTorch).

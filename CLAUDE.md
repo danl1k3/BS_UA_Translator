@@ -1,37 +1,42 @@
 # CLAUDE.md
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+It describes the `heroku-hf-spaces` branch (Option A in `PLAN.md`).
 
 ## Overview
 
-Neural translation app (default Bosnian `bos_Latn` → Ukrainian `ukr_Cyrl`) built on NLLB-200 distilled 600M (int8 CTranslate2 model), a FastAPI backend and a React frontend. Comments, docstrings and UI strings are largely in Ukrainian. No tests exist in the repo.
+Bosnian (`bos_Latn`) ↔ Ukrainian (`ukr_Cyrl`) translation. A React frontend talks to a slim FastAPI gateway (Heroku), which calls a Gradio ZeroGPU Space (`Danlike/NLLB-200-600-endpoint`, fine-tuned NLLB-200 600M) over HTTP. The gateway runs no model. The Space code lives on Hugging Face, not here. Comments, docstrings and UI strings are largely in Ukrainian.
 
 ## Commands
 
-Backend (from `backend/`; Python 3.10 in Docker, root `pyproject.toml` declares >=3.12 but has no deps):
-- `pip install -r requirements.txt` (`requirements_nllb.txt` is a UTF-16 pip-freeze of a Windows venv)
-- `uvicorn app.main:app --reload --port 8000`
-- Requires a CTranslate2 model dir at `backend/models/nllb_int8/` (git-ignored) containing `sentencepiece.bpe.model`. Override via `MODEL_PATH` / `TOKENIZER_PATH` env vars or a `backend/.env` (simple KEY=VALUE, loaded manually in `main.py`).
-- `python copy_cuda_dlls.py` — Windows-only helper that copies cuBLAS/cuDNN DLLs into the model dir.
+From the repo root:
+- `pip install -r backend/requirements-dev.txt` (Python 3.12, exact pins; keep Docker and CI in step)
+- `pytest` (all) or `pytest backend/tests/test_batching.py -k name` (one)
+- `ruff check backend`
+- `cd backend && uvicorn app.main:app --reload --port 8000` — needs `REMOTE_INFERENCE_URL` (see `backend/.env.example`)
 
-Frontend (from `frontend/`): `npm run dev`, `npm run build` (runs `tsc -b` first), `npm run lint`.
+From `frontend/`: `npm run dev`, `npm test` (Node 22.18+), `npm run lint`, `npm run build` (runs `tsc -b` first).
 
-Full stack: `docker compose up --build` (backend needs the NVIDIA container toolkit; mounts `./backend/models`; frontend served by nginx on port 80).
+Full stack: `docker compose up --build` (frontend on port 80; backend bound to localhost only).
 
 ## Architecture
 
-Backend request flow: `main.py` (routes) → `FileTranslationManager` (file endpoints only) → `TranslationQueueManager` → `NLLBTranslator`.
+Backend (`backend/app/`):
+- `main.py`: `create_app(settings, backend)`; middleware order is CORS (outermost) → rate limit → request size check (all POSTs). Tests inject a fake backend (`tests/fakes.py`).
+- `backends.py`: `TranslatorBackend` interface, `GradioBackend` (submit to `/gradio_api/call/translate`, read the SSE result; health via `/config`, cached 30 s, no GPU), error types with a user-safe `public_message`, and `LANGUAGE_PAIRS`.
+- `batching.py`: the single translation path for text and files. Splits into sentences, cuts long ones to 220 characters, sends one segment per line in batches of up to 2000 characters, then restores line breaks.
+- `documents.py`: parses `.txt`, `.html`, `.docx` into a list of texts plus a `build` function. DOCX: body paragraphs only; formatting is kept by redistributing words over runs.
+- `job_queue.py`: in-process queue, one worker (the Space handles one request at a time), bounded, results kept with a TTL, cancellable.
+- `routers/`: `GET /health`, `POST /translate/stream` (SSE: `message`, `end`, `error`), `POST /translate/file/submit`, `GET /translate/file/status`, `GET /translate/file/result`, `DELETE /translate/file/job`.
 
-- `translator.py`: loads the same model on both `cuda` and `cpu` CTranslate2 translators (either may fail to init and is skipped). `translate_stream` splits text into sentences by regex and translates one sentence at a time (beam 4, repetition penalty 1.2), yielding each as it finishes. Source lang code is prepended as a token and the target lang as `target_prefix`.
-- `queue_manager.py`: picks a device per request using `HealthChecker`, enforces separate GPU (4) / CPU (8) semaphores, and runs the sync generator in an executor to expose it as an async stream. Errors are yielded inline as `[Помилка: ...]` text rather than raised.
-- `monitor.py`: NVML/psutil metrics; GPU free VRAM < 500 MB → "Slow Mode", routes to CPU. Also supplies `/health`.
-- `file_translator.py`: parses uploads (plain text, HTML, `.docx` via python-docx preserving paragraph styles and run formatting through `_distribute_to_runs`), groups sentences into ~800-char chunks, translates them concurrently through the queue manager, and reassembles. `process_upload_stream` emits progress events; finished results are held in an in-memory `_results` dict keyed by `job_id` and fetched via `GET /translate/file/result`.
-- Endpoints: `GET /health`, `POST /translate/stream` (SSE), `POST /translate/file`, `POST /translate/file/stream` (SSE progress), `GET /translate/file/result`. Note `debug` defaults to `true` on file endpoints, which wraps output in a ZIP with `translation_meta.json`.
+Frontend (`frontend/src/`): `api.ts` (all requests go through `apiFetch`), `sse.ts`, hooks `useTranslate` and `useHealth`, components `TextTranslator`, `FileUploader` (submit, poll, download), `InferenceStatusBadge`.
 
-Frontend (`frontend/src`): `App.tsx` with `components/TextTranslator.tsx` and `components/FileUploader.tsx`, plus hooks `useStreaming` (SSE text translation) and `useHealth`.
+## Constraints
 
-## Gotchas
-
-- API base URL is inconsistent: `FileUploader.tsx` uses `VITE_API_URL` (default `http://localhost:8000`, baked in at build time via docker-compose build arg), but `useStreaming.ts` and `useHealth.ts` fetch relative paths (`/translate/stream`, `/health`). Neither `vite.config.ts` nor `nginx.conf` defines a proxy, so those relative calls only work if one is added.
-- CORS is wide open (`allow_origins=["*"]`); no auth. README TODOs: better infrastructure, refactor, security, user accounts.
-- `main.py` contains Windows DLL-path setup (`setup_windows_dlls`) that runs at import time, and the Content-Disposition header helper is duplicated several times inline.
+- The Space truncates sentences above 128 tokens and requests above 2000 characters; `batching.py` exists to respect this and relies on the Space returning one line per input line.
+- Every visitor spends the daily ZeroGPU quota of the `REMOTE_API_TOKEN` owner: avoid extra calls, never send the token to the browser.
+- Upload limit is 3 MB / 20,000 characters (`config.py`). `nginx.conf` `client_max_body_size` and `FileUploader.tsx` must match.
+- Queue, results and rate limit counters are in memory: run a single instance and process; state is lost on restart.
+- The rate limiter trusts only the rightmost `X-Forwarded-For` entry, so the backend must sit behind a proxy (Heroku router, nginx). Only POST requests are limited.
+- `VITE_API_URL` is baked in at build time; empty means same origin (nginx or Vite proxy). A separate frontend origin must be listed in `CORS_ORIGINS`.
+- Client errors must stay generic; details go to server logs.
