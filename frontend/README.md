@@ -23,4 +23,5 @@ By default, Vite proxies `/translate` and `/health` to `http://localhost:8000` (
 - `npm run dev` — Start Vite dev server
 - `npm run build` — Type-check (`tsc -b`) and build production bundle
 - `npm run lint` — Run ESLint
+- `npm test` — Run SSE parser tests (Node 22.18+)
 - `npm run preview` — Preview production build locally

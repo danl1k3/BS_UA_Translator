@@ -1,9 +1,13 @@
 import { useState } from 'react';
 import { ArrowLeftRight, Copy, Check, Loader2, AlertTriangle } from 'lucide-react';
-import type { TranslatorProps } from '../App';
+import type { useTranslate } from '../hooks/useTranslate';
+import type { InferenceStatus } from '../hooks/useHealth';
+import { errorMessage } from '../api';
 import FileUploader from './FileUploader';
 
-export default function TextTranslator({ translate, output, isLoading, error: propError, clearOutput, inferenceStatus }: TranslatorProps) {
+type Props = ReturnType<typeof useTranslate> & { inferenceStatus: InferenceStatus };
+
+export default function TextTranslator({ translate, output, isLoading, error: propError, clearOutput, inferenceStatus }: Props) {
   const [sourceText, setSourceText] = useState('');
   const [copied, setCopied] = useState(false);
   const [direction, setDirection] = useState('balkan_to_ua');
@@ -32,7 +36,7 @@ export default function TextTranslator({ translate, output, isLoading, error: pr
       clearOutput();
       await translate(sourceText, sourceLang, targetLang);
     } catch (err: unknown) {
-      setLocalError(err instanceof Error ? err.message : 'Невідома помилка');
+      setLocalError(errorMessage(err));
     }
   };
 

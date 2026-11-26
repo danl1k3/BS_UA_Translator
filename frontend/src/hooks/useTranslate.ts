@@ -1,0 +1,60 @@
+import { useRef, useState } from 'react';
+import { apiFetch, errorMessage } from '../api';
+import { takeEvents } from '../sse';
+
+// Довше за тайм-аут gateway (120 с), щоб помилку повідомив сервер.
+const TRANSLATE_TIMEOUT_MS = 150_000;
+
+export function useTranslate() {
+  const [output, setOutput] = useState('');
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const controllerRef = useRef<AbortController | null>(null);
+
+  const translate = async (text: string, sourceLang: string, targetLang: string) => {
+    controllerRef.current?.abort();
+    const controller = new AbortController();
+    controllerRef.current = controller;
+    setIsLoading(true);
+    setOutput('');
+    setError(null);
+
+    const timeoutId = setTimeout(() => {
+      controller.abort();
+      setError('Час очікування вичерпано. Спробуйте ще раз за хвилину.');
+    }, TRANSLATE_TIMEOUT_MS);
+
+    try {
+      const response = await apiFetch('/translate/stream', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text, source_lang: sourceLang, target_lang: targetLang }),
+        signal: controller.signal,
+      });
+      const reader = response.body!.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const parsed = takeEvents(buffer + decoder.decode(value, { stream: true }));
+        buffer = parsed.rest;
+
+        for (const { event, data } of parsed.events) {
+          if (event === 'message') setOutput(data);
+          if (event === 'error') {
+            setError(data === 'Translation failed' ? 'Переклад не вдався. Спробуйте ще раз.' : data);
+          }
+        }
+      }
+    } catch (err: unknown) {
+      if (!controller.signal.aborted) setError(errorMessage(err));
+    } finally {
+      clearTimeout(timeoutId);
+      if (controllerRef.current === controller) setIsLoading(false);
+    }
+  };
+
+  return { translate, output, isLoading, error, clearOutput: () => setOutput('') };
+}

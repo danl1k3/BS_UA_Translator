@@ -1,11 +1,6 @@
 import { Loader2, Wifi, WifiOff, Coffee } from 'lucide-react';
 import type { InferenceStatus } from '../hooks/useHealth';
 
-interface Props {
-  status: InferenceStatus;
-  eta?: number;
-}
-
 const statusConfig: Record<InferenceStatus, {
   label: string;
   icon: React.ReactNode;
@@ -38,22 +33,15 @@ const statusConfig: Record<InferenceStatus, {
   },
 };
 
-export default function InferenceStatusBadge({ status, eta }: Props) {
+export default function InferenceStatusBadge({ status }: { status: InferenceStatus }) {
   const config = statusConfig[status];
   return (
-    <div className="flex items-center gap-2">
-      <div
-        className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-semibold border ${config.className}`}
-        title={config.description}
-      >
-        {config.icon}
-        {config.label}
-      </div>
-      {status === 'waking_up' && eta !== undefined && (
-        <span className="text-[10px] text-amber-600 font-mono">
-          ~{Math.ceil(eta)}с
-        </span>
-      )}
+    <div
+      className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-semibold border ${config.className}`}
+      title={config.description}
+    >
+      {config.icon}
+      {config.label}
     </div>
   );
 }
