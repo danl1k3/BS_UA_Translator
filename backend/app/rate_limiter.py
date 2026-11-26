@@ -1,7 +1,6 @@
 """Simple in-process rate limiter with per-IP and signed-cookie session counters.
 
-For Option A (Heroku + HF Spaces) this is sufficient for a minimal demo.
-Phase 3 replaces the in-process store with Redis for multi-dyno deployments.
+Enough for a single-dyno demo. A shared store (Redis) is needed for several instances.
 """
 
 import hashlib
@@ -12,6 +11,7 @@ import uuid
 from typing import Any
 
 from fastapi import Request, Response
+from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 
 logger = logging.getLogger(__name__)
@@ -131,10 +131,14 @@ def _verify(signed: str, secret: str) -> str | None:
 
 
 def _get_client_ip(request: Request) -> str:
-    """Extract client IP, respecting X-Forwarded-For behind a proxy."""
-    forwarded = request.headers.get("x-forwarded-for")
+    """Extract client IP, respecting X-Forwarded-For behind a proxy.
+
+    Only the rightmost entry is used: the trusted proxy (Heroku router, nginx)
+    appends it, while everything to its left is supplied by the client.
+    """
+    forwarded = ",".join(request.headers.getlist("x-forwarded-for"))
     if forwarded:
-        return forwarded.split(",")[0].strip()
+        return forwarded.split(",")[-1].strip()
     return request.client.host if request.client else "unknown"
 
 
@@ -151,7 +155,8 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         app: Any,
         requests_per_minute: int = 20,
         burst: int = 5,
-        cookie_secret: str = "change-me-in-production",
+        *,
+        cookie_secret: str,
     ) -> None:
         super().__init__(app)
         self.ip_store = RateLimitStore(requests_per_minute, burst)
@@ -161,8 +166,8 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
     async def dispatch(
         self, request: Request, call_next: RequestResponseEndpoint
     ) -> Response:
-        # Skip rate limiting for health checks
-        if request.url.path == "/health":
+        # Only POST requests cost GPU time; health checks and job polling are free
+        if request.method != "POST":
             return await call_next(request)
 
         client_ip = _get_client_ip(request)
@@ -186,23 +191,13 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
                 session_id[:8],
                 retry_after,
             )
-            from fastapi.responses import JSONResponse
-
-            resp = JSONResponse(
-                {"detail": "Too many requests. Please try again later."},
+            response: Response = JSONResponse(
+                {"detail": "Забагато запитів. Спробуйте пізніше."},
                 status_code=429,
                 headers={"Retry-After": str(int(retry_after) + 1)},
             )
-            resp.set_cookie(
-                _COOKIE_NAME,
-                _sign(session_id, self.cookie_secret),
-                httponly=True,
-                samesite="lax",
-                max_age=86400,
-            )
-            return resp
-
-        response = await call_next(request)
+        else:
+            response = await call_next(request)
 
         # Always set/refresh the session cookie
         response.set_cookie(

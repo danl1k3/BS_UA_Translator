@@ -5,5 +5,10 @@ router = APIRouter()
 
 @router.get("/health")
 async def get_health(request: Request):
-    """Return current gateway and remote inference health status."""
-    return await request.app.state.queue_manager.get_current_status()
+    """Return inference reachability and the file queue length."""
+    inference = await request.app.state.backend.check_health()
+    return {
+        "status": inference["status"],
+        "queue_size": request.app.state.jobs.size,
+        "inference": inference,
+    }

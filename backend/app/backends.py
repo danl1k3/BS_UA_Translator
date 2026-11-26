@@ -1,136 +1,120 @@
-import asyncio
+import json
 import logging
-import threading
+import time
 from abc import ABC, abstractmethod
-from typing import AsyncGenerator
 
 import httpx
 
-from .sentence_splitter import split_sentences
-
 logger = logging.getLogger(__name__)
+
+# (source, target) -> direction key understood by the Space
+LANGUAGE_PAIRS = {
+    ("bos_Latn", "ukr_Cyrl"): "bs-ua",
+    ("ukr_Cyrl", "bos_Latn"): "ua-bs",
+}
+
+
+class TranslationError(RuntimeError):
+    """Inference failure. `public_message` is safe to show to the user."""
+
+    public_message = "Translation failed"
+
+
+class QuotaExceededError(TranslationError):
+    """The ZeroGPU quota of the account that owns the token is used up."""
+
+    public_message = "Денний ліміт GPU вичерпано. Спробуйте пізніше."
 
 
 class TranslatorBackend(ABC):
-    """Abstract interface for translation inference backends."""
-
-    def split_into_sentences(self, text: str) -> list[str]:
-        """Split text into sentences for chunking."""
-        return split_sentences(text)
-
-    async def check_health(self) -> dict[str, object] | None:
-        """Check inference service health."""
-        return None
+    """Interface to the inference service."""
 
     @abstractmethod
-    async def translate_stream(
-        self,
-        text: str,
-        source_lang: str,
-        target_lang: str,
-    ) -> AsyncGenerator[str, None]:
-        """Stream translated text chunks asynchronously."""
-        yield ""  # pragma: no cover
+    async def translate(self, text: str, source_lang: str, target_lang: str) -> str:
+        """Translate text, returning one output line for every input line."""
+
+    @abstractmethod
+    async def check_health(self) -> dict[str, object]:
+        """Return `status` and `reachable` of the inference service."""
 
 
-class RemoteBackend(TranslatorBackend):
-    """HTTP SSE client backend calling HF Spaces inference off the event loop."""
+class GradioBackend(TranslatorBackend):
+    """Client for the `/translate` endpoint of a Gradio (ZeroGPU) Space.
+
+    With a token, GPU time is charged to the token owner's quota.
+    """
+
+    API_PATH = "/gradio_api/call/translate"
+    HEALTH_TTL_SECONDS = 30.0
 
     def __init__(
         self,
         base_url: str,
         timeout: float = 120.0,
         api_token: str = "",
+        transport: httpx.AsyncBaseTransport | None = None,
     ):
         if not base_url:
             raise ValueError("REMOTE_INFERENCE_URL must be configured")
         self.base_url = base_url.rstrip("/")
         self.timeout = httpx.Timeout(timeout, connect=15.0)
-        self.headers: dict[str, str] = {}
-        if api_token:
-            self.headers["Authorization"] = f"Bearer {api_token}"
+        self.headers = {"Authorization": f"Bearer {api_token}"} if api_token else {}
+        self.transport = transport
+        self._health: tuple[float, dict[str, object]] | None = None
 
-    def _health_sync(self) -> dict[str, object]:
-        url = f"{self.base_url}/health"
-        with httpx.Client(timeout=httpx.Timeout(3.0), headers=self.headers) as client:
-            resp = client.get(url)
-            resp.raise_for_status()
-            return resp.json()
-
-    async def check_health(self) -> dict[str, object] | None:
-        try:
-            return await asyncio.to_thread(self._health_sync)
-        except Exception as e:
-            logger.warning("Remote inference health check failed: %s", e)
-            return {"status": "Waking up", "device": "remote", "reachable": False}
-
-    def _stream_worker(
-        self,
-        text: str,
-        source_lang: str,
-        target_lang: str,
-        loop: asyncio.AbstractEventLoop,
-        queue: asyncio.Queue[object],
-        stop_event: threading.Event,
-        sentinel: object,
-    ) -> None:
-        """Stream SSE chunks from HF Spaces in a worker thread."""
-        url = f"{self.base_url}/translate/stream"
-        payload = {
-            "text": text,
-            "source_lang": source_lang,
-            "target_lang": target_lang,
-        }
-        try:
-            with httpx.Client(timeout=self.timeout, headers=self.headers) as client:
-                with client.stream("POST", url, json=payload) as resp:
-                    resp.raise_for_status()
-                    current_event = "message"
-                    for raw_line in resp.iter_lines():
-                        if stop_event.is_set():
-                            break
-                        line = raw_line.rstrip("\r\n")
-                        if not line.strip():
-                            continue
-                        if line.startswith("event:"):
-                            current_event = line.split(":", 1)[1].strip()
-                        elif line.startswith("data:"):
-                            data = line.split(":", 1)[1].lstrip()
-                            if current_event == "error":
-                                raise RuntimeError(f"Remote inference error: {data}")
-                            if data == "[DONE]":
-                                break
-                            loop.call_soon_threadsafe(queue.put_nowait, data)
-        except Exception as exc:
-            loop.call_soon_threadsafe(queue.put_nowait, exc)
-        finally:
-            loop.call_soon_threadsafe(queue.put_nowait, sentinel)
-
-    async def translate_stream(
-        self,
-        text: str,
-        source_lang: str,
-        target_lang: str,
-    ) -> AsyncGenerator[str, None]:
-        loop = asyncio.get_running_loop()
-        queue: asyncio.Queue[object] = asyncio.Queue()
-        stop_event = threading.Event()
-        sentinel = object()
-
-        worker = threading.Thread(
-            target=self._stream_worker,
-            args=(text, source_lang, target_lang, loop, queue, stop_event, sentinel),
-            daemon=True,
+    def _client(self, timeout: httpx.Timeout) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            base_url=self.base_url,
+            headers=self.headers,
+            timeout=timeout,
+            transport=self.transport,
         )
-        worker.start()
 
+    async def check_health(self) -> dict[str, object]:
+        """Probe `/config`, which needs no GPU. Cached to limit traffic."""
+        now = time.monotonic()
+        if self._health and now - self._health[0] < self.HEALTH_TTL_SECONDS:
+            return self._health[1]
+        status = "Waking up"
         try:
-            while True:
-                item = await queue.get()
-                if item is sentinel:
-                    break
-                if isinstance(item, Exception):
-                    raise item
-                yield str(item)
-        finally:
-            stop_event.set()
+            async with self._client(httpx.Timeout(3.0)) as client:
+                code = (await client.get("/config")).status_code
+            if code == 200:
+                status = "Normal"
+            elif code in (401, 403, 404):
+                status = "Unavailable"
+        except httpx.HTTPError as exc:
+            logger.warning("Space health check failed: %s", exc)
+        health: dict[str, object] = {"status": status, "reachable": status == "Normal"}
+        self._health = (now, health)
+        return health
+
+    async def translate(self, text: str, source_lang: str, target_lang: str) -> str:
+        direction = LANGUAGE_PAIRS.get((source_lang, target_lang))
+        if direction is None:
+            raise TranslationError(f"Unsupported pair: {source_lang} -> {target_lang}")
+        async with self._client(self.timeout) as client:
+            submitted = await client.post(self.API_PATH, json={"data": [text, direction]})
+            submitted.raise_for_status()
+            event_id = submitted.json()["event_id"]
+
+            async with client.stream("GET", f"{self.API_PATH}/{event_id}") as resp:
+                resp.raise_for_status()
+                event = ""
+                async for line in resp.aiter_lines():
+                    if line.startswith("event:"):
+                        event = line.split(":", 1)[1].strip()
+                    elif line.startswith("data:") and event in ("complete", "error"):
+                        payload = json.loads(line.split(":", 1)[1])
+                        if event == "error":
+                            raise self._to_error(payload)
+                        return payload[0]
+
+        raise TranslationError("Space closed the stream without a result")
+
+    @staticmethod
+    def _to_error(payload: object) -> TranslationError:
+        details = payload if isinstance(payload, dict) else {}
+        message = f"{details.get('title') or ''}: {details.get('error') or ''}"
+        error_type = QuotaExceededError if "quota" in message.lower() else TranslationError
+        return error_type(f"Space error: {message}")

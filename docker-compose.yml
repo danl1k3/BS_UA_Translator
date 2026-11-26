@@ -5,10 +5,13 @@ services:
       dockerfile: Dockerfile
     container_name: translator-backend
     ports:
-      - "8000:8000"
+      # Local access only: public traffic goes through nginx, which sets X-Forwarded-For
+      - "127.0.0.1:8000:8000"
     environment:
-      - REMOTE_INFERENCE_URL=${REMOTE_INFERENCE_URL:-https://your-space.hf.space}
+      - REMOTE_INFERENCE_URL=${REMOTE_INFERENCE_URL:-https://danlike-nllb-200-600-endpoint.hf.space}
       - REMOTE_API_TOKEN=${REMOTE_API_TOKEN:-}
+      - COOKIE_SECRET=${COOKIE_SECRET:-}
+      - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost}
       - PYTHONUNBUFFERED=1
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]

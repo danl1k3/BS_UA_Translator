@@ -1,17 +1,16 @@
-import io
-import json
+import asyncio
 import logging
 import os
-import uuid
-import zipfile
 
-from fastapi import APIRouter, HTTPException, Request, UploadFile
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, HTTPException, Request, Response, UploadFile
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
+from ..backends import LANGUAGE_PAIRS, TranslationError
+from ..batching import translate_texts
+from ..documents import DocumentError, parse_document
 from ..http_utils import make_content_disposition_header
-from ..job_store import JobStatus
+from ..job_queue import Job, JobStatus, QueueFullError
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -23,56 +22,33 @@ class TranslationRequest(BaseModel):
     target_lang: str = Field("ukr_Cyrl", description="Код цільової мови (наприклад, ukr_Cyrl)")
 
 
-class _InMemoryUpload:
-    def __init__(self, filename: str | None, content_type: str | None, data: bytes):
-        self.filename = filename
-        self.content_type = content_type
-        self._data = data
-
-    async def read(self) -> bytes:
-        return self._data
-
-
-async def _read_and_validate_upload(upload_file: UploadFile, request: Request) -> bytes:
-    """Validate file extension and size limit, returning raw file bytes."""
-    settings = request.app.state.settings
-    filename = upload_file.filename or ""
-    _, ext = os.path.splitext(filename.lower())
-    if ext not in settings.allowed_extensions:
-        raise HTTPException(status_code=415, detail="Unsupported file type")
-
-    raw_bytes = await upload_file.read()
-    if len(raw_bytes) > settings.max_upload_bytes:
-        raise HTTPException(status_code=413, detail="File too large")
-    return raw_bytes
+def _check_languages(source_lang: str, target_lang: str) -> None:
+    if (source_lang, target_lang) not in LANGUAGE_PAIRS:
+        raise HTTPException(status_code=400, detail="Непідтримувана пара мов")
 
 
 @router.post("/translate/stream")
-async def translate_stream(request: TranslationRequest, raw_request: Request):
-    """Streaming text translation endpoint (SSE)."""
-    if not request.text.strip():
+async def translate_stream(body: TranslationRequest, request: Request):
+    """Text translation over SSE; keep-alive pings are sent while the GPU works."""
+    if not body.text.strip():
         raise HTTPException(status_code=400, detail="Текст порожній")
+    _check_languages(body.source_lang, body.target_lang)
+    backend = request.app.state.backend
 
-    queue_manager = raw_request.app.state.queue_manager
-
+    # A client disconnect cancels this generator and with it the Space request.
     async def event_generator():
-        stream = queue_manager.stream_translation(
-            request.text,
-            request.target_lang,
-            source_lang=request.source_lang,
-        )
         try:
-            async for chunk in stream:
-                if await raw_request.is_disconnected():
-                    break
-                yield {"event": "message", "data": chunk}
-            else:
-                yield {"event": "end", "data": "[DONE]"}
+            result = await translate_texts(
+                backend, [body.text.strip()], body.source_lang, body.target_lang
+            )
+            yield {"event": "message", "data": result[0]}
+            yield {"event": "end", "data": "[DONE]"}
+        except TranslationError as exc:
+            logger.warning("Translation failed: %s", exc)
+            yield {"event": "error", "data": exc.public_message}
         except Exception:
-            logger.exception("Streaming translation failed")
-            yield {"event": "error", "data": "Translation failed"}
-        finally:
-            await stream.aclose()
+            logger.exception("Translation failed")
+            yield {"event": "error", "data": TranslationError.public_message}
 
     return EventSourceResponse(event_generator())
 
@@ -84,194 +60,76 @@ async def submit_file_job(
     source_lang: str = "bos_Latn",
     target_lang: str = "ukr_Cyrl",
 ):
-    """Submit a file for async translation. Returns immediately with a job_id.
+    """Validate a file and queue it for translation. Returns a job_id at once."""
+    _check_languages(source_lang, target_lang)
+    settings = request.app.state.settings
+    backend = request.app.state.backend
 
-    Use GET /translate/file/status?job_id=... to poll progress,
-    then GET /translate/file/result?job_id=... to download the result.
-    Required for Heroku's 30-second first-byte limit on long file jobs.
-    """
-    if not upload_file:
-        raise HTTPException(status_code=400, detail="No file uploaded")
+    raw = await upload_file.read(settings.max_upload_bytes + 1)
+    if len(raw) > settings.max_upload_bytes:
+        raise HTTPException(status_code=413, detail="Файл завеликий")
 
-    raw_bytes = await _read_and_validate_upload(upload_file, request)
-    inmem = _InMemoryUpload(upload_file.filename, upload_file.content_type, raw_bytes)
-    file_manager = request.app.state.file_manager
-    job_store = request.app.state.job_store
+    filename = upload_file.filename or ""
+    try:
+        document = await asyncio.to_thread(parse_document, filename, raw, source_lang)
+    except DocumentError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    if sum(map(len, document.texts)) > settings.max_file_chars:
+        limit = settings.max_file_chars
+        raise HTTPException(status_code=413, detail=f"Забагато тексту (ліміт {limit} символів)")
 
-    import asyncio
+    async def work(progress):
+        translated = await translate_texts(
+            backend, document.texts, source_lang, target_lang, progress
+        )
+        return await asyncio.to_thread(document.build, translated)
 
-    job = job_store.create_job()
+    base, ext = os.path.splitext(filename)
+    try:
+        job = request.app.state.jobs.submit(work, f"{base}_translated{ext}", document.media_type)
+    except QueueFullError as exc:
+        raise HTTPException(
+            status_code=503, detail="Черга заповнена. Спробуйте пізніше."
+        ) from exc
+    return {"job_id": job.job_id, "status": job.status}
 
-    async def _run_job():
-        try:
-            translated = await file_manager.process_upload(inmem, source_lang, target_lang)
-            base, ext = os.path.splitext(upload_file.filename or "translated")
-            translated_filename = f"{base}_translated{ext}"
-            is_binary = isinstance(translated, (bytes, bytearray))
-            content_type = (
-                upload_file.content_type or ("application/octet-stream" if is_binary else "text/plain")
-            )
-            job_store.set_complete(job.job_id, translated, translated_filename, content_type)
-        except Exception:
-            logger.exception("Async file job %s failed", job.job_id)
-            job_store.set_failed(job.job_id, "Translation failed")
 
-    task = asyncio.create_task(_run_job())
-    job_store.register_task(job.job_id, task)
-    job_store.set_running(job.job_id, total_chunks=0)
-
-    return {"job_id": job.job_id, "status": "pending"}
+def _find_job(request: Request, job_id: str) -> Job:
+    job = request.app.state.jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
 
 
 @router.get("/translate/file/status")
 async def get_file_job_status(job_id: str, request: Request):
-    """Poll the status and progress of an async file translation job."""
-    job_store = request.app.state.job_store
-    status = job_store.status_dict(job_id)
-    if status["status"] == "not_found":
-        raise HTTPException(status_code=404, detail="Job not found")
-    return status
+    """Poll the status and progress of a file job."""
+    job = _find_job(request, job_id)
+    return {
+        "job_id": job.job_id,
+        "status": job.status,
+        "progress_current": job.progress_current,
+        "progress_total": job.progress_total,
+        "filename": job.filename,
+        "error": job.error,
+    }
 
 
 @router.get("/translate/file/result")
 async def get_translated_file(job_id: str, request: Request):
-    """Return stored translated file for given job_id."""
-    # Try the new job store first
-    job_store = request.app.state.job_store
-    job = job_store.get_job(job_id)
-    if job is not None:
-        if job.status == JobStatus.RUNNING or job.status == JobStatus.PENDING:
-            raise HTTPException(status_code=202, detail="Job still in progress")
-        if job.status == JobStatus.FAILED:
-            raise HTTPException(status_code=500, detail=job.error or "Translation failed")
-        data = job_store.get_result_data(job_id)
-        if data is None:
-            raise HTTPException(status_code=404, detail="Result not found")
-        filename = job.result_filename or f"result_{job_id}"
-        content_type = job.result_content_type or "application/octet-stream"
-        headers = make_content_disposition_header(filename)
-        if isinstance(data, (bytes, bytearray)):
-            return StreamingResponse(io.BytesIO(data), media_type=content_type, headers=headers)
-        return StreamingResponse(
-            io.StringIO(data), media_type=content_type, headers=headers
-        )
-
-    # Fallback: legacy in-memory results from FileTranslationManager
-    file_manager = request.app.state.file_manager
-    res = file_manager.fetch_result(job_id)
-    if not res:
-        raise HTTPException(status_code=404, detail="Result not found")
-
-    data = res["data"]
-    content_type = res.get("content_type", "application/octet-stream")
-    filename = res.get("filename", f"result_{job_id}")
-    headers = make_content_disposition_header(filename)
-
-    if res.get("is_binary"):
-        return StreamingResponse(io.BytesIO(data), media_type=content_type, headers=headers)
-    return StreamingResponse(
-        io.StringIO(data), media_type=content_type or "text/plain", headers=headers
+    """Download the translated file of a completed job."""
+    job = _find_job(request, job_id)
+    if job.status != JobStatus.COMPLETE:
+        raise HTTPException(status_code=409, detail=job.error or "Job still in progress")
+    return Response(
+        job.result,
+        media_type=job.media_type,
+        headers=make_content_disposition_header(job.filename),
     )
 
 
-@router.post("/translate/file")
-async def translate_file(
-    upload_file: UploadFile,
-    request: Request,
-    source_lang: str = "bos_Latn",
-    target_lang: str = "ukr_Cyrl",
-    debug: bool = False,
-):
-    """Translate an uploaded file and return it directly (or a ZIP with metadata if debug=true)."""
-    if not upload_file:
-        raise HTTPException(status_code=400, detail="No file uploaded")
-
-    raw_bytes = await _read_and_validate_upload(upload_file, request)
-    inmem = _InMemoryUpload(upload_file.filename, upload_file.content_type, raw_bytes)
-    file_manager = request.app.state.file_manager
-
-    try:
-        translated = await file_manager.process_upload(inmem, source_lang, target_lang)
-        base, ext = os.path.splitext(upload_file.filename or "translated")
-        translated_filename = f"{base}_translated{ext}"
-        is_binary = isinstance(translated, (bytes, bytearray))
-
-        if debug:
-            bio = io.BytesIO()
-            with zipfile.ZipFile(bio, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-                if is_binary:
-                    zf.writestr(translated_filename, translated)
-                else:
-                    zf.writestr(translated_filename, str(translated).encode("utf-8"))
-
-                meta = {
-                    "filename": translated_filename,
-                    "content_type": upload_file.content_type,
-                    "translated_preview": str(translated)[:10000],
-                }
-                zf.writestr(
-                    "translation_meta.json",
-                    json.dumps(meta, ensure_ascii=False, indent=2),
-                )
-            bio.seek(0)
-            headers = make_content_disposition_header(f"{base}_translated.zip")
-            return StreamingResponse(bio, media_type="application/zip", headers=headers)
-
-        headers = make_content_disposition_header(translated_filename)
-        if is_binary:
-            return StreamingResponse(
-                io.BytesIO(translated),
-                media_type=upload_file.content_type or "application/octet-stream",
-                headers=headers,
-            )
-        return StreamingResponse(
-            io.StringIO(str(translated)),
-            media_type=upload_file.content_type or "text/plain",
-            headers=headers,
-        )
-    except HTTPException:
-        raise
-    except Exception:
-        logger.exception("File translation failed")
-        raise HTTPException(status_code=500, detail="Translation failed")
-
-
-@router.post("/translate/file/stream")
-async def translate_file_stream(
-    upload_file: UploadFile,
-    raw_request: Request,
-    source_lang: str = "bos_Latn",
-    target_lang: str = "ukr_Cyrl",
-    debug: bool = False,
-):
-    """Stream progress events (SSE) during file translation."""
-    raw_bytes = await _read_and_validate_upload(upload_file, raw_request)
-    inmem = _InMemoryUpload(upload_file.filename, upload_file.content_type, raw_bytes)
-    job_id = uuid.uuid4().hex
-    file_manager = raw_request.app.state.file_manager
-
-    async def event_generator():
-        stream = file_manager.process_upload_stream(
-            inmem, source_lang, target_lang, job_id=job_id, debug=debug
-        )
-        try:
-            async for ev in stream:
-                if await raw_request.is_disconnected():
-                    break
-                event_name = ev.get("event", "message")
-                if isinstance(ev, dict):
-                    payload_obj = {k: v for k, v in ev.items() if k != "event"}
-                    try:
-                        payload = json.dumps(payload_obj, ensure_ascii=False)
-                    except Exception:
-                        payload = str(payload_obj)
-                else:
-                    payload = str(ev)
-                yield {"event": event_name, "data": payload}
-        except Exception:
-            logger.exception("Streaming file translation failed")
-            yield {"event": "error", "data": "Translation failed"}
-        finally:
-            await stream.aclose()
-
-    return EventSourceResponse(event_generator())
+@router.delete("/translate/file/job", status_code=204)
+async def cancel_file_job(job_id: str, request: Request):
+    """Cancel a queued or running job so it stops using GPU quota."""
+    if not request.app.state.jobs.cancel(job_id):
+        raise HTTPException(status_code=404, detail="Job not found")

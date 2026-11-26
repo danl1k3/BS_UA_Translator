@@ -1,15 +1,13 @@
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
-from .backends import RemoteBackend, TranslatorBackend
+from .backends import GradioBackend, TranslatorBackend
 from .config import Settings
-from .file_translator import FileTranslationManager
-from .job_store import JobStore
-from .monitor import HealthChecker
-from .queue_manager import TranslationQueueManager
+from .job_queue import JobQueue
 from .rate_limiter import RateLimitMiddleware
 from .routers.health import router as health_router
 from .routers.translate import router as translate_router
@@ -19,72 +17,67 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 
+_MULTIPART_OVERHEAD_BYTES = 64 * 1024
 
-def _create_backend(settings: Settings) -> TranslatorBackend:
-    return RemoteBackend(
+
+def create_backend(settings: Settings) -> TranslatorBackend:
+    return GradioBackend(
         base_url=settings.remote_inference_url,
         timeout=settings.remote_timeout_seconds,
         api_token=settings.remote_api_token,
     )
 
 
-def _wire_dependencies(
-    app: FastAPI, cfg: Settings, active_backend: TranslatorBackend
-) -> None:
-    health_checker = HealthChecker()
-    queue_manager = TranslationQueueManager(
-        active_backend,
-        health_checker,
-        max_concurrency=cfg.max_concurrent_translations,
-    )
-    file_manager = FileTranslationManager(
-        queue_manager,
-        active_backend,
-        result_ttl_seconds=cfg.result_ttl_seconds,
-        max_stored_results=cfg.max_stored_results,
-    )
-    job_store = JobStore(
-        result_ttl_seconds=cfg.result_ttl_seconds,
-        max_jobs=cfg.max_stored_results * 2,
-    )
-    app.state.settings = cfg
-    app.state.backend = active_backend
-    app.state.health_checker = health_checker
-    app.state.queue_manager = queue_manager
-    app.state.file_manager = file_manager
-    app.state.job_store = job_store
-
-
 def create_app(
     settings: Settings | None = None,
     backend: TranslatorBackend | None = None,
 ) -> FastAPI:
-    """Create and configure the Heroku gateway FastAPI application."""
+    """Create and configure the gateway FastAPI application."""
     cfg = settings or Settings()
 
     @asynccontextmanager
     async def lifespan(fastapi_app: FastAPI):
-        if getattr(fastapi_app.state, "backend", None) is None:
-            _wire_dependencies(fastapi_app, cfg, _create_backend(cfg))
+        if fastapi_app.state.backend is None:
+            fastapi_app.state.backend = create_backend(cfg)
+        fastapi_app.state.jobs.start()
         yield
+        await fastapi_app.state.jobs.stop()
 
     app = FastAPI(title="BalkanTranslate Gateway API", lifespan=lifespan)
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=cfg.cors_origins,
-        allow_credentials=False,
-        allow_methods=["*"],
-        allow_headers=["*"],
+    app.state.settings = cfg
+    app.state.backend = backend
+    app.state.jobs = JobQueue(
+        max_queued=cfg.max_queued_jobs,
+        result_ttl_seconds=cfg.result_ttl_seconds,
+        max_stored=cfg.max_stored_results,
     )
+
+    # Middleware added later wraps the earlier ones.
+    @app.middleware("http")
+    async def limit_body_size(request: Request, call_next):
+        """Refuse large requests before the body is read or spooled to disk."""
+        if request.method == "POST":
+            length = request.headers.get("content-length", "")
+            if not length.isdigit():
+                return JSONResponse({"detail": "Content-Length required"}, status_code=411)
+            if int(length) > cfg.max_upload_bytes + _MULTIPART_OVERHEAD_BYTES:
+                return JSONResponse({"detail": "Файл завеликий"}, status_code=413)
+        return await call_next(request)
+
     app.add_middleware(
         RateLimitMiddleware,
         requests_per_minute=cfg.rate_limit_rpm,
         burst=cfg.rate_limit_burst,
         cookie_secret=cfg.cookie_secret,
     )
-
-    if backend is not None:
-        _wire_dependencies(app, cfg, backend)
+    # Outermost: preflights are answered first and error responses keep CORS headers.
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=cfg.cors_origins,
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "DELETE"],
+        allow_headers=["*"],
+    )
 
     app.include_router(health_router)
     app.include_router(translate_router)
@@ -92,8 +85,3 @@ def create_app(
 
 
 app = create_app()
-
-if __name__ == "__main__":
-    import uvicorn
-
-    uvicorn.run(app, host="127.0.0.1", port=8000)
