@@ -6,12 +6,13 @@ from fastapi import APIRouter, HTTPException, Request, Response, UploadFile
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
-from ..backends import LANGUAGE_PAIRS, TranslationError
-from ..batching import translate_texts
+from ..backends import LANGUAGE_PAIRS, QuotaExceededError, TranslationError
+from ..batching import prepare_batches, translate_texts
 from ..documents import DocumentError, parse_document
 from ..history import content_key
 from ..http_utils import make_content_disposition_header
 from ..job_queue import Job, JobStatus, QueueFullError
+from ..rate_limiter import get_client_ip
 from ..sanitize import clean_filename, clean_text
 
 logger = logging.getLogger(__name__)
@@ -19,6 +20,7 @@ router = APIRouter()
 
 TEXT_DONE = "This text is already translated."
 TEXT_RUNNING = "This text is already being translated. Wait for the result."
+OVER_DAILY_LIMIT = "This is more than what is left of your daily limit on this site."
 
 
 class TranslationRequest(BaseModel):
@@ -32,18 +34,41 @@ def _check_languages(source_lang: str, target_lang: str) -> None:
         raise HTTPException(status_code=400, detail="This language pair is not supported")
 
 
-@router.post("/translate/stream")
-async def translate_stream(body: TranslationRequest, request: Request):
-    """Text translation over SSE; keep-alive pings are sent while the GPU works.
-
-    A `notice` event tells the visitor that the same text is already done or running.
-    """
+def _checked_text(body: TranslationRequest) -> str:
     text = clean_text(body.text).strip()
     if not text:
         raise HTTPException(status_code=400, detail="The text is empty")
     _check_languages(body.source_lang, body.target_lang)
+    return text
+
+
+@router.post("/translate/direct")
+async def prepare_direct_call(body: TranslationRequest, request: Request):
+    """Prepare a call from the visitor's browser to the Space, on their own quota.
+
+    Uses no GPU time here; the token is never involved.
+    """
+    batches, layout = prepare_batches(_checked_text(body))
+    return {
+        "url": request.app.state.settings.remote_inference_url.rstrip("/"),
+        "direction": LANGUAGE_PAIRS[body.source_lang, body.target_lang],
+        "batches": batches,
+        "layout": layout,
+    }
+
+
+@router.post("/translate/stream")
+async def translate_stream(body: TranslationRequest, request: Request):
+    """Text translation over SSE; keep-alive pings are sent while the GPU works.
+
+    A `notice` event tells the visitor that the same text is already done or running,
+    a `limit` event that the shared quota or the visitor's daily limit is used up.
+    """
+    text = _checked_text(body)
     backend = request.app.state.backend
     history = request.app.state.history
+    budget = request.app.state.budget
+    ip = get_client_ip(request)
     direction = LANGUAGE_PAIRS[body.source_lang, body.target_lang]
     key = content_key(request.state.visitor, direction, text.encode())
 
@@ -56,9 +81,14 @@ async def translate_stream(body: TranslationRequest, request: Request):
             yield {"event": "notice", "data": TEXT_RUNNING}
             yield {"event": "end", "data": "[DONE]"}
             return
+        elif not budget.try_spend(ip, len(text)):
+            yield {"event": "limit", "data": OVER_DAILY_LIMIT}
+            yield {"event": "end", "data": "[DONE]"}
+            return
         else:
+            # A cancelled translation is not refunded: it may have used GPU time
             try:
-                # Nothing is awaited between the check above and this mark
+                # Nothing is awaited between the checks above and this mark
                 with history.running(key):
                     [result] = await translate_texts(
                         backend, [text], body.source_lang, body.target_lang
@@ -66,10 +96,13 @@ async def translate_stream(body: TranslationRequest, request: Request):
                     history.save(key, result)
             except TranslationError as exc:
                 logger.warning("Translation failed: %s", exc)
-                yield {"event": "error", "data": exc.public_message}
+                budget.refund(ip, len(text))
+                event = "limit" if isinstance(exc, QuotaExceededError) else "error"
+                yield {"event": event, "data": exc.public_message}
                 return
             except Exception:
                 logger.exception("Translation failed")
+                budget.refund(ip, len(text))
                 yield {"event": "error", "data": TranslationError.public_message}
                 return
         yield {"event": "message", "data": result}
@@ -99,15 +132,23 @@ async def submit_file_job(
         document = await asyncio.to_thread(parse_document, filename, raw, source_lang)
     except DocumentError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
-    if sum(map(len, document.texts)) > settings.max_file_chars:
+    chars = sum(map(len, document.texts))
+    if chars > settings.max_file_chars:
         limit = settings.max_file_chars
         raise HTTPException(status_code=413, detail=f"Too much text (the limit is {limit} characters)")
 
+    budget = request.app.state.budget
+    ip = get_client_ip(request)
+
     async def work(progress):
-        translated = await translate_texts(
-            backend, document.texts, source_lang, target_lang, progress
-        )
-        return await asyncio.to_thread(document.build, translated)
+        try:
+            translated = await translate_texts(
+                backend, document.texts, source_lang, target_lang, progress
+            )
+            return await asyncio.to_thread(document.build, translated)
+        except Exception:
+            budget.refund(ip, chars)
+            raise
 
     base, ext = os.path.splitext(filename)
     jobs = request.app.state.jobs
@@ -118,9 +159,12 @@ async def submit_file_job(
     if job is not None:
         duplicate = "complete" if job.status == JobStatus.COMPLETE else "processing"
         return {"job_id": job.job_id, "status": job.status, "duplicate": duplicate}
+    if not budget.try_spend(ip, chars):
+        raise HTTPException(status_code=429, detail=OVER_DAILY_LIMIT)
     try:
         job = jobs.submit(work, f"{base}_translated{ext}", document.media_type, key)
     except QueueFullError as exc:
+        budget.refund(ip, chars)
         raise HTTPException(
             status_code=503, detail="The queue is full. Try again later."
         ) from exc

@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from .backends import GradioBackend, TranslatorBackend
+from .budget import DailyBudget
 from .config import Settings
 from .history import TranslationHistory
 from .job_queue import JobQueue
@@ -54,6 +55,7 @@ def create_app(
         result_ttl_seconds=cfg.result_ttl_seconds,
         max_stored=cfg.max_stored_results,
     )
+    app.state.budget = DailyBudget(cfg.daily_chars_per_ip)
     app.state.history = TranslationHistory(
         ttl_seconds=cfg.result_ttl_seconds, max_entries=cfg.max_stored_results
     )

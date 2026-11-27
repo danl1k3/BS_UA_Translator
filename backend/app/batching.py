@@ -56,6 +56,21 @@ def _batches(segments: list[str]) -> list[list[str]]:
     return batches
 
 
+def _split_lines(text: str) -> list[list[str]]:
+    """The segments of every line of the cleaned text."""
+    return [split_segments(line) for line in clean_text(text).split("\n")]
+
+
+def prepare_batches(text: str) -> tuple[list[str], list[int]]:
+    """Requests for a client that calls the Space itself.
+
+    Returns the request texts and how many segments belong to each line.
+    """
+    lines = _split_lines(text)
+    batches = _batches([segment for line in lines for segment in line])
+    return ["\n".join(batch) for batch in batches], [len(line) for line in lines]
+
+
 async def translate_texts(
     backend: TranslatorBackend,
     texts: list[str],
@@ -64,7 +79,7 @@ async def translate_texts(
     on_progress: Callable[[int, int], None] = lambda done, total: None,
 ) -> list[str]:
     """Translate several texts together, keeping their line breaks."""
-    layout = [[split_segments(line) for line in clean_text(t).split("\n")] for t in texts]
+    layout = [_split_lines(text) for text in texts]
     batches = _batches([s for lines in layout for line in lines for s in line])
 
     translated: list[str] = []

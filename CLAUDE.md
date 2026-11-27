@@ -25,17 +25,19 @@ Backend (`backend/app/`):
 - `main.py`: `create_app(settings, backend)`; middleware order is CORS (outermost) → `no-store` on API paths → rate limit → request size check (all POSTs). The built frontend is mounted at `/` if `static_dir` (`backend/static`) exists; locally use the Vite dev server instead. Tests inject a fake backend (`tests/fakes.py`).
 - `backends.py`: `TranslatorBackend` interface, `GradioBackend` (submit to `/gradio_api/call/translate`, read the SSE result; health via `/config`, cached 30 s, no GPU; token owner's quota from huggingface.co, cached 15 s), error types with a user-safe `public_message`, and `LANGUAGE_PAIRS`.
 - `sanitize.py`: removes control and invisible characters from input and file names; `batching.py` applies it to all translated text.
+- `budget.py`: in-memory daily character allowance per IP; repeats are free, failures are refunded.
 - `history.py`: in-memory, per-visitor memory of text translations. File repeats are matched in `job_queue.py` by the same key (session cookie, direction, content hash). Never share matches between visitors.
 - `batching.py`: the single translation path for text and files. Splits into sentences, cuts long ones to 220 characters, sends one segment per line in batches of up to 2000 characters, then restores line breaks.
 - `documents.py`: parses `.txt`, `.html`, `.docx` into a list of texts plus a `build` function. DOCX: body paragraphs only; formatting is kept by redistributing words over runs.
 - `job_queue.py`: in-process queue, one worker (the Space handles one request at a time), bounded, results kept with a TTL, cancellable.
-- `routers/`: `GET /health`, `GET /quota`, `POST /translate/stream` (SSE: `notice`, `message`, `end`, `error`), `POST /translate/file/submit`, `GET /translate/file/status`, `GET /translate/file/result`, `DELETE /translate/file/job`.
+- `routers/`: `GET /health`, `GET /quota`, `POST /translate/stream` (SSE: `notice`, `limit`, `message`, `end`, `error`), `POST /translate/direct`, `POST /translate/file/submit`, `GET /translate/file/status`, `GET /translate/file/result`, `DELETE /translate/file/job`.
 
-Frontend (`frontend/src/`): `api.ts` (all requests go through `apiFetch`), `sse.ts`, `quota.ts`, hooks `useTranslate`, `useHealth` and `useQuota`, components `TextTranslator`, `FileUploader` (submit, poll, download), `InferenceStatusBadge`, `QuotaBadge`, `Notice`.
+Frontend (`frontend/src/`): `api.ts` (all requests go through `apiFetch`), `sse.ts`, `quota.ts`, `direct.ts` (opt-in call from the browser to the Space, without token or cookies), hooks `useTranslate`, `useHealth` and `useQuota`, components `TextTranslator`, `FileUploader` (submit, poll, download), `InferenceStatusBadge`, `QuotaBadge`, `Notice`.
 
 ## Constraints
 
 - The Space truncates sentences above 128 tokens and requests above 2000 characters; `batching.py` exists to respect this and relies on the Space returning one line per input line.
+- The direct call needs a public Space that allows cross-origin requests; the server only prepares the batches, so segmentation stays in `batching.py`.
 - Every visitor spends the daily ZeroGPU quota of the `REMOTE_API_TOKEN` owner: avoid extra calls, never send the token to the browser.
 - Upload limit is 3 MB / 20,000 characters (`config.py`). `FileUploader.tsx` must match.
 - Queue, results, translation history and rate limit counters are in memory: run a single instance and process; state is lost on restart.

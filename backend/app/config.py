@@ -33,6 +33,9 @@ class Settings(BaseSettings):
     result_ttl_seconds: int = 3600
     max_stored_results: int = 100
 
+    # Characters one IP address may have translated per day
+    daily_chars_per_ip: int = 20_000
+
     # Rate limiting
     rate_limit_rpm: int = 20  # requests per minute per key
     rate_limit_burst: int = 5

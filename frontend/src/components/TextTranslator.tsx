@@ -4,6 +4,7 @@ import type { useTranslate } from '../hooks/useTranslate';
 import type { InferenceStatus } from '../hooks/useHealth';
 import { errorMessage } from '../api';
 import ErrorMessage from './ErrorMessage';
+import DirectOffer from './DirectOffer';
 import FileUploader from './FileUploader';
 import Notice from './Notice';
 
@@ -13,7 +14,7 @@ const MAX_CHARS = 2000;
 const BOSNIAN = { name: 'Bosnian', code: 'bos_Latn', htmlLang: 'bs' };
 const UKRAINIAN = { name: 'Ukrainian', code: 'ukr_Cyrl', htmlLang: 'uk' };
 
-export default function TextTranslator({ translate, output, isLoading, error: propError, notice, clearOutput, inferenceStatus }: Props) {
+export default function TextTranslator({ translate, translateAsVisitor, output, isLoading, error: propError, notice, limit, clearOutput, inferenceStatus }: Props) {
   const [sourceText, setSourceText] = useState('');
   const [copied, setCopied] = useState(false);
   const [fromBosnian, setFromBosnian] = useState(true);
@@ -34,7 +35,6 @@ export default function TextTranslator({ translate, output, isLoading, error: pr
     }
 
     try {
-      clearOutput();
       await translate(sourceText, source.code, target.code);
     } catch (err: unknown) {
       setLocalError(errorMessage(err));
@@ -121,6 +121,13 @@ export default function TextTranslator({ translate, output, isLoading, error: pr
 
         {notice && <Notice message={notice} />}
         {displayError && <ErrorMessage message={displayError} />}
+        {limit && (
+          <DirectOffer
+            reason={limit}
+            disabled={!sourceText.trim() || isLoading}
+            onAccept={() => void translateAsVisitor(sourceText, source.code, target.code)}
+          />
+        )}
 
         <div className="p-4 border-t border-line flex justify-center">
           <button

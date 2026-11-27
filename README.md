@@ -20,12 +20,12 @@ flowchart LR
 
 - **Frontend (`frontend/`)**: React 19 + TypeScript + Tailwind CSS. Text translation, file translation (`.txt`, `.docx`, `.html`) with progress, and inference status badges.
 - **Gateway (`backend/`)**: Slim FastAPI service without model dependencies. Provides:
-  - Per-IP rate limiting with a signed anonymous-session cookie.
+  - Per-IP rate limiting with a signed anonymous-session cookie, and a daily character allowance per IP.
   - `TranslatorBackend` abstraction with `GradioBackend` calling the Space.
   - Batching that keeps requests within the model's token limit and saves GPU quota.
   - A simple in-process queue for file jobs (submit, poll, download, cancel).
   - Input cleaning (control and invisible characters) and per-visitor repeat detection, so the same text or file is not translated twice.
-  - The remaining ZeroGPU quota of the token owner, shown on the page.
+  - The remaining ZeroGPU quota of the token owner, shown on the page. When it or a visitor's allowance runs out, the visitor can choose to call the Space from their browser on their own anonymous quota (text only; the Space must be public).
 - **Training & Conversion (`training/`)**: Scripts and requirements for fine-tuning NLLB-200, converting to CTranslate2 (`int8`), and evaluating BLEU/chrF++ scores.
 
 ---
@@ -90,7 +90,8 @@ To host the frontend elsewhere instead, build it with `VITE_API_URL=<gateway URL
 | :--- | :--- | :--- |
 | `GET` | `/health` | Inference reachability and file queue length |
 | `GET` | `/quota` | Remaining ZeroGPU quota in seconds, or `null` if it cannot be read |
-| `POST` | `/translate/stream` | Stream text translation via Server-Sent Events (`text`, `source_lang`, `target_lang`); `notice` marks a repeat |
+| `POST` | `/translate/stream` | Stream text translation via Server-Sent Events (`text`, `source_lang`, `target_lang`); `notice` marks a repeat, `limit` a used-up quota |
+| `POST` | `/translate/direct` | Prepare text for a call from the browser to the Space; returns `url`, `direction`, `batches`, `layout` |
 | `POST` | `/translate/file/submit` | Queue a file (up to 3 MB and 20,000 characters) and return `job_id`; `duplicate` marks a repeat |
 | `GET` | `/translate/file/status` | Job status and progress (`?job_id=...`) |
 | `GET` | `/translate/file/result` | Download the translated file (`?job_id=...`) |
@@ -130,7 +131,7 @@ npm run build
 ## Limitations
 
 - **Cold Starts:** Free-tier Hugging Face Spaces sleep after inactivity; the first translation may take 30–60 seconds while the model loads.
-- **GPU Quota:** All visitors share the daily ZeroGPU quota of the token owner.
+- **GPU Quota:** All visitors share the daily ZeroGPU quota of the token owner; `DAILY_CHARS_PER_IP` (default 20,000) caps each address.
 - **In-Process State:** Rate-limit buckets, the file queue, results and repeat detection live in memory of a single gateway instance and are lost on restart.
 - **Documents:** `.docx` translation covers body paragraphs only (not tables, headers or footers); `.html` output keeps paragraph text only.
 - **Sentence Splitting:** Regex-based; abbreviations may split mid-sentence. Sentences over 220 characters are cut at a clause or word boundary to fit the model, which can affect quality.

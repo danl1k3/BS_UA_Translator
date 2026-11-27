@@ -23,7 +23,7 @@ class TranslationError(RuntimeError):
 class QuotaExceededError(TranslationError):
     """The ZeroGPU quota of the account that owns the token is used up."""
 
-    public_message = "The daily GPU limit is used up. Try again later."
+    public_message = "Today's shared translation limit is used up. Try again later."
 
 
 class TranslatorBackend(ABC):

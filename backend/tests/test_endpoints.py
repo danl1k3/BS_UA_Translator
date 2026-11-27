@@ -28,15 +28,15 @@ def test_translate_rejects_bad_requests(body, status):
 
 
 @pytest.mark.parametrize(
-    "error,message",
+    "error,event,message",
     [
-        (RuntimeError("secret internal stack trace"), "Translation failed"),
-        (QuotaExceededError("secret details"), QuotaExceededError.public_message),
+        (RuntimeError("secret internal stack trace"), "error", "Translation failed"),
+        (QuotaExceededError("secret details"), "limit", QuotaExceededError.public_message),
     ],
 )
-def test_translate_errors_are_safe(error, message):
+def test_translate_errors_are_safe(error, event, message):
     resp = _translate(make_client(FakeBackend(error)))
-    assert f"event: error\r\ndata: {message}" in resp.text
+    assert f"event: {event}\r\ndata: {message}" in resp.text
     assert "secret" not in resp.text
 
 

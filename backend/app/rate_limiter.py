@@ -130,7 +130,7 @@ def _verify(signed: str, secret: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 
-def _get_client_ip(request: Request) -> str:
+def get_client_ip(request: Request) -> str:
     """Extract client IP, respecting X-Forwarded-For behind a proxy.
 
     Only the rightmost entry is used: the trusted proxy (the Heroku router)
@@ -170,7 +170,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         if request.method != "POST":
             return await call_next(request)
 
-        client_ip = _get_client_ip(request)
+        client_ip = get_client_ip(request)
 
         # Read or create session from signed cookie
         session_id: str | None = None
