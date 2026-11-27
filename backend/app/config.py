@@ -6,7 +6,8 @@ from typing import Annotated
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
-_BACKEND_ENV = Path(__file__).resolve().parent.parent / ".env"
+_BACKEND_DIR = Path(__file__).resolve().parent.parent
+_BACKEND_ENV = _BACKEND_DIR / ".env"
 _PLACEHOLDER_SECRET = "change-me-in-production"
 
 
@@ -22,7 +23,10 @@ class Settings(BaseSettings):
         "http://localhost",
     ]
 
-    # File translation. nginx.conf must allow at least max_upload_bytes.
+    # Built frontend, served at "/" if the folder exists (it does in the Docker image)
+    static_dir: str = str(_BACKEND_DIR / "static")
+
+    # File translation. FileUploader.tsx shows the same upload limit.
     max_upload_bytes: int = 3 * 1024 * 1024
     max_file_chars: int = 20_000  # each file costs GPU quota
     max_queued_jobs: int = 10

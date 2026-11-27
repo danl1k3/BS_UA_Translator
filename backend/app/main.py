@@ -1,9 +1,11 @@
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from .backends import GradioBackend, TranslatorBackend
 from .config import Settings
@@ -70,6 +72,14 @@ def create_app(
         burst=cfg.rate_limit_burst,
         cookie_secret=cfg.cookie_secret,
     )
+    @app.middleware("http")
+    async def forbid_caching_api(request: Request, call_next):
+        """Translations and job states must not be stored by a CDN or a browser."""
+        response = await call_next(request)
+        if request.url.path == "/health" or request.url.path.startswith("/translate/"):
+            response.headers["Cache-Control"] = "no-store"
+        return response
+
     # Outermost: preflights are answered first and error responses keep CORS headers.
     app.add_middleware(
         CORSMiddleware,
@@ -81,6 +91,9 @@ def create_app(
 
     app.include_router(health_router)
     app.include_router(translate_router)
+    # Mounted last so that API routes take precedence
+    if Path(cfg.static_dir).is_dir():
+        app.mount("/", StaticFiles(directory=cfg.static_dir, html=True), name="frontend")
     return app
 
 

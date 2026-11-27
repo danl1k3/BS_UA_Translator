@@ -14,7 +14,7 @@ This branch implements **Option A: Split Services (Gateway + Hosted Inference)**
 
 ```mermaid
 flowchart LR
-    User["Browser (React + Vite)"] -->|SSE / REST| Gateway["FastAPI Gateway (Heroku)"]
+    User["Browser (React + Vite)"] -->|page, SSE, REST| Gateway["FastAPI Gateway + built frontend (one Heroku dyno)"]
     Gateway -->|Gradio HTTP API + Bearer Token| HF["HF ZeroGPU Space (Gradio, NLLB-200)"]
 ```
 
@@ -38,8 +38,7 @@ export REMOTE_API_TOKEN="hf_..."   # GPU time is charged to this account
 docker compose up --build
 ```
 
-- Frontend: `http://localhost`
-- Backend API: `http://localhost:8000`
+Open `http://localhost`. One container serves both the web page and the API, on this machine only.
 
 ### 2. Local Development (without Docker)
 
@@ -67,16 +66,18 @@ Vite proxies `/translate` and `/health` to `http://localhost:8000` by default (o
 ### 3. Deploying to Heroku + Hugging Face Spaces
 
 1. **Hugging Face Space**: a Gradio ZeroGPU Space with a `/translate` endpoint taking `(text, direction)`, where `direction` is `bs-ua` or `ua-bs` (currently [`Danlike/NLLB-200-600-endpoint`](https://huggingface.co/spaces/Danlike/NLLB-200-600-endpoint)). All visitors share the daily GPU quota of the token owner.
-2. **Heroku Gateway**:
+2. **Heroku app** (web page and API; the root `Dockerfile` builds both):
    ```bash
-   heroku stack:set container
-   heroku config:set REMOTE_INFERENCE_URL="https://danlike-nllb-200-600-endpoint.hf.space"
-   heroku config:set REMOTE_API_TOKEN="hf_..."
-   heroku config:set COOKIE_SECRET="$(openssl rand -hex 32)"
-   heroku config:set CORS_ORIGINS="https://your-frontend.example.com"
+   heroku create <app-name> --stack container
+   heroku config:set -a <app-name> \
+     REMOTE_INFERENCE_URL="https://danlike-nllb-200-600-endpoint.hf.space" \
+     COOKIE_SECRET="$(openssl rand -hex 32)"
+   # add REMOTE_API_TOKEN in the dashboard (Settings -> Config Vars)
+   heroku git:remote -a <app-name>
    git push heroku main
    ```
-3. **Frontend**: build with `VITE_API_URL=https://your-gateway.herokuapp.com npm run build` and host `frontend/dist` as a static site; add its origin to `CORS_ORIGINS`.
+
+To host the frontend elsewhere instead, build it with `VITE_API_URL=<gateway URL> npm run build` and set `CORS_ORIGINS` on the gateway to its address.
 
 ---
 

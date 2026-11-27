@@ -1,0 +1,10 @@
+# Send only what the image needs, so secrets and local files stay out
+*
+!backend/requirements.txt
+!backend/app
+!frontend
+frontend/node_modules
+frontend/dist
+**/.env*
+**/__pycache__
+**/*.pyc

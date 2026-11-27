@@ -13,7 +13,7 @@ Measured RAM of the int8 model: about 800 MB, so a VPS needs at least 2 GB.
 - **Inference:** the model on HF Space, called through a `RemoteBackend`. May cold-start; the UI needs a "waking up" state and timeouts.
 - **Cache / rate-limit counters / job results:** Upstash Redis (watch per-command billing: 1-2 commands per request).
 - **Database:** Heroku Postgres (about $5/month, fits the remaining credit); used later for accounts.
-- **Frontend:** static hosting or an nginx container.
+- **Frontend:** built into the gateway image and served by FastAPI on the same dyno (one origin, no CORS). It can move to a CDN or static hosting later via `VITE_API_URL` and `CORS_ORIGINS`.
 - Constraints to design for: Heroku 30 s first-byte limit and 55 s idle limit (long file jobs must be async: submit job, then poll/stream status); ephemeral filesystem (job results go to Redis with a TTL, or object storage for big files).
 - Pros: multiple services with clear boundaries (light I/O-bound gateway vs. memory-hungry model), cheap, covered by student credit. Cons: two platforms to debug, inference cold starts.
 

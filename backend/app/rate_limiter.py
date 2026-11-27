@@ -133,7 +133,7 @@ def _verify(signed: str, secret: str) -> str | None:
 def _get_client_ip(request: Request) -> str:
     """Extract client IP, respecting X-Forwarded-For behind a proxy.
 
-    Only the rightmost entry is used: the trusted proxy (Heroku router, nginx)
+    Only the rightmost entry is used: the trusted proxy (the Heroku router)
     appends it, while everything to its left is supplied by the client.
     """
     forwarded = ",".join(request.headers.getlist("x-forwarded-for"))
