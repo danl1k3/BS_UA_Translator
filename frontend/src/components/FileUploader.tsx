@@ -1,12 +1,14 @@
 import { useRef, useState } from 'react';
-import { Loader2, UploadCloud, FileText, CheckCircle2, AlertTriangle } from 'lucide-react';
+import { Loader2, Download } from 'lucide-react';
 import { apiFetch, errorMessage } from '../api';
 import type { InferenceStatus } from '../hooks/useHealth';
+import ErrorMessage from './ErrorMessage';
 import Notice from './Notice';
 
 interface Props {
   sourceLang: string;
   targetLang: string;
+  direction: string;
   inferenceStatus: InferenceStatus;
 }
 
@@ -22,8 +24,8 @@ interface JobStatus {
 const MAX_FILE_BYTES = 3 * 1024 * 1024;
 const POLL_INTERVAL_MS = 2000;
 const DUPLICATE_NOTICES = {
-  processing: 'Цей файл уже перекладається. Показуємо прогрес.',
-  complete: 'Цей файл уже перекладено. Можна завантажити результат.',
+  processing: 'This file is already being translated. Showing its progress.',
+  complete: 'This file is already translated. You can download it.',
 };
 
 interface Submitted {
@@ -31,7 +33,7 @@ interface Submitted {
   duplicate: keyof typeof DUPLICATE_NOTICES | null;
 }
 
-export default function FileUploader({ sourceLang, targetLang, inferenceStatus }: Props) {
+export default function FileUploader({ sourceLang, targetLang, direction, inferenceStatus }: Props) {
   const [file, setFile] = useState<File | null>(null);
   const [job, setJob] = useState<(JobStatus & { id: string }) | null>(null);
   const [busy, setBusy] = useState(false);
@@ -46,7 +48,7 @@ export default function FileUploader({ sourceLang, targetLang, inferenceStatus }
     if (!next || busy) return;
     setJob(null);
     setNotice(null);
-    setError(next.size > MAX_FILE_BYTES ? 'Файл завеликий (ліміт 3 МБ).' : null);
+    setError(next.size > MAX_FILE_BYTES ? 'The file is too large. The limit is 3 MB.' : null);
     setFile(next.size > MAX_FILE_BYTES ? null : next);
   };
 
@@ -78,7 +80,7 @@ export default function FileUploader({ sourceLang, targetLang, inferenceStatus }
         const status = (await response.json()) as JobStatus;
         if (signal.aborted) break;
         setJob({ ...status, id });
-        if (status.status === 'failed') throw new Error(status.error ?? 'Переклад не вдався.');
+        if (status.status === 'failed') throw new Error(status.error ?? 'Translation failed.');
         if (status.status === 'complete') return;
         await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
       }
@@ -109,112 +111,105 @@ export default function FileUploader({ sourceLang, targetLang, inferenceStatus }
     : 0;
 
   return (
-    <div className="max-w-5xl mx-auto p-4 lg:p-8">
+    <section className="mt-8">
       <div
         onDrop={(e) => {
           e.preventDefault();
           selectFile(e.dataTransfer.files[0]);
         }}
         onDragOver={(e) => e.preventDefault()}
-        className={`mt-6 p-8 border-2 border-dashed rounded-3xl text-center transition-all duration-300 ${
-          file ? 'border-indigo-300 bg-indigo-50/30' : 'border-slate-200 bg-white'
+        className={`p-6 bg-white border-2 border-dashed rounded-lg ${
+          file ? 'border-blue' : 'border-line'
         } ${isUnavailable ? 'opacity-60' : ''}`}
       >
-        <div className="flex flex-col items-center gap-4">
-          <div className={`p-4 rounded-2xl ${file ? 'bg-indigo-100 text-indigo-600' : 'bg-slate-100 text-slate-400'}`}>
-            {file ? <FileText className="w-10 h-10" /> : <UploadCloud className="w-10 h-10" />}
-          </div>
-
-          <div>
-            <div className="text-xl font-bold text-slate-800">
-              {file ? file.name : 'Завантажити файл для пакетного перекладу'}
-            </div>
-            <div className="text-sm text-slate-500 mt-1">
+        <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-5">
+          <div className="min-w-0">
+            <h2 className="text-lg font-semibold break-all">
+              {file ? file.name : `Translate a file from ${direction}`}
+            </h2>
+            <p className="text-muted">
               {file
-                ? `${Math.round(file.size / 1024)} KB`
-                : 'Підтримується: .txt, .docx, .html — до 3 МБ та 20 000 символів'}
-            </div>
+                ? `${Math.max(1, Math.round(file.size / 1024))} KB, ${direction}`
+                : 'Drop a .txt, .docx or .html file here. Up to 3 MB and 20,000 characters.'}
+            </p>
           </div>
 
-          <div className="flex flex-col w-full max-w-md gap-4 mt-2">
-            {busy && (
-              <div className="w-full">
-                <div className="flex justify-between mb-2 px-1 text-sm font-bold text-indigo-600">
-                  <span className="flex items-center gap-2">
-                    <Loader2 className="w-3 h-3 animate-spin" />
-                    {job?.status === 'running' ? 'Перекладаємо...' : 'У черзі...'}
-                  </span>
-                  <span className="font-black">{percent}%</span>
-                </div>
-                <div className="w-full bg-slate-200 rounded-full h-3 overflow-hidden shadow-inner">
-                  <div
-                    className="bg-indigo-600 h-full rounded-full transition-all duration-500"
-                    style={{ width: `${percent}%` }}
-                  />
-                </div>
-              </div>
+          <div className="flex flex-col sm:flex-row gap-3 flex-shrink-0">
+            {busy ? (
+              <button onClick={() => controllerRef.current?.abort()} className="btn btn-secondary">
+                Cancel
+              </button>
+            ) : (
+              <>
+                <button onClick={() => inputRef.current?.click()} className="btn btn-secondary">
+                  Choose file
+                </button>
+                <button
+                  onClick={handleUpload}
+                  className={`btn sm:min-w-[12rem] ${
+                    job?.status === 'complete' ? 'btn-secondary' : 'btn-primary'
+                  }`}
+                  disabled={!file || isUnavailable}
+                >
+                  {isUnavailable ? 'Service unavailable' : 'Translate file'}
+                </button>
+              </>
             )}
+          </div>
+        </div>
 
-            <div className="flex flex-wrap justify-center gap-3 mt-2">
-              {busy ? (
-                <button
-                  onClick={() => controllerRef.current?.abort()}
-                  className="px-6 py-2.5 bg-rose-50 text-rose-700 border border-rose-100 rounded-xl font-bold hover:bg-rose-100 transition-colors"
-                >
-                  Скасувати
-                </button>
-              ) : (
-                <>
-                  <button
-                    onClick={() => inputRef.current?.click()}
-                    className="px-6 py-2.5 bg-white border border-slate-200 text-slate-700 rounded-xl font-bold hover:bg-slate-50 transition-colors shadow-sm"
-                  >
-                    Вибрати файл
-                  </button>
-                  <button
-                    onClick={handleUpload}
-                    className="px-6 py-2.5 bg-indigo-600 text-white rounded-xl font-bold hover:bg-indigo-700 transition-all shadow-lg shadow-indigo-100 disabled:opacity-50 disabled:shadow-none"
-                    disabled={!file || isUnavailable}
-                  >
-                    {isUnavailable ? 'Сервіс недоступний' : 'Перекласти'}
-                  </button>
-                </>
-              )}
-
-              {!busy && job?.status === 'complete' && (
-                <button
-                  onClick={() => handleDownload(job.id, job.filename)}
-                  className="px-6 py-2.5 bg-emerald-600 text-white rounded-xl font-bold hover:bg-emerald-700 transition-all shadow-lg shadow-emerald-100 flex items-center gap-2"
-                >
-                  <CheckCircle2 className="w-5 h-5" />
-                  Завантажити результат
-                </button>
-              )}
+        {busy && (
+          <div className="mt-5">
+            <div className="flex justify-between mb-2">
+              <span className="flex items-center gap-2">
+                <Loader2 className="w-4 h-4 animate-spin" />
+                {job?.status === 'running' ? 'Translating…' : 'Waiting in the queue…'}
+              </span>
+              <span className="tabular-nums">{percent}%</span>
+            </div>
+            <div
+              role="progressbar"
+              aria-label="File translation"
+              aria-valuenow={percent}
+              aria-valuemin={0}
+              aria-valuemax={100}
+              className="h-2 bg-ground"
+            >
+              <div className="h-full bg-blue transition-all duration-500" style={{ width: `${percent}%` }} />
             </div>
           </div>
+        )}
 
-          <input
-            ref={inputRef}
-            type="file"
-            onChange={(e) => selectFile(e.target.files?.[0])}
-            className="hidden"
-            accept=".txt,.docx,.html,.htm"
-          />
-        </div>
+        {!busy && job?.status === 'complete' && (
+          <button
+            onClick={() => handleDownload(job.id, job.filename)}
+            className="btn btn-primary mt-5 w-full"
+          >
+            <Download className="w-5 h-5" />
+            Download translation
+          </button>
+        )}
+
+        <input
+          ref={inputRef}
+          type="file"
+          onChange={(e) => selectFile(e.target.files?.[0])}
+          className="hidden"
+          accept=".txt,.docx,.html,.htm"
+        />
       </div>
 
       {notice && (
-        <div className="mt-6">
+        <div className="mt-4">
           <Notice message={notice} />
         </div>
       )}
 
       {error && (
-        <div className="mt-6 flex items-center gap-2 bg-rose-50 p-4 rounded-2xl border border-rose-100 text-rose-700 text-sm font-semibold">
-          <AlertTriangle className="w-4 h-4 flex-shrink-0" />
-          {error}
+        <div className="mt-4">
+          <ErrorMessage message={error} />
         </div>
       )}
-    </div>
+    </section>
   );
 }

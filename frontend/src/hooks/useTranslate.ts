@@ -23,7 +23,7 @@ export function useTranslate() {
 
     const timeoutId = setTimeout(() => {
       controller.abort();
-      setError('Час очікування вичерпано. Спробуйте ще раз за хвилину.');
+      setError('The request timed out. Try again in a minute.');
     }, TRANSLATE_TIMEOUT_MS);
 
     try {
@@ -47,7 +47,7 @@ export function useTranslate() {
           if (event === 'message') setOutput(data);
           if (event === 'notice') setNotice(data);
           if (event === 'error') {
-            setError(data === 'Translation failed' ? 'Переклад не вдався. Спробуйте ще раз.' : data);
+            setError(data === 'Translation failed' ? 'Translation failed. Try again.' : data);
           }
         }
       }

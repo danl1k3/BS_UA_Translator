@@ -2,18 +2,17 @@ import { describeQuota, type Quota } from '../quota';
 
 export default function QuotaBadge({ quota }: { quota: Quota }) {
   const reset = quota.resets_at
-    ? `Оновиться ${new Date(quota.resets_at).toLocaleString('uk-UA')}`
-    : 'Спільний добовий ліміт для всіх відвідувачів';
+    ? `Resets ${new Date(quota.resets_at).toLocaleString('en-GB', { dateStyle: 'medium', timeStyle: 'short' })}`
+    : 'A daily limit shared by all visitors';
+  const share = quota.total_seconds
+    ? Math.min(100, (quota.remaining_seconds / quota.total_seconds) * 100)
+    : 0;
   return (
-    <div
-      className={`px-2.5 py-1 rounded-lg text-xs font-semibold border ${
-        quota.remaining_seconds > 0
-          ? 'bg-slate-50 text-slate-600 border-slate-200'
-          : 'bg-rose-50 text-rose-700 border-rose-200'
-      }`}
-      title={reset}
-    >
-      {describeQuota(quota)}
+    <div title={reset} className="text-sm">
+      <div className="tabular-nums">{describeQuota(quota)}</div>
+      <div className="mt-1 h-1 bg-white/25" aria-hidden="true">
+        <div className="h-full bg-sun" style={{ width: `${share}%` }} />
+      </div>
     </div>
   );
 }

@@ -5,7 +5,7 @@ It describes the `heroku-hf-spaces` branch (Option A in `PLAN.md`).
 
 ## Overview
 
-Bosnian (`bos_Latn`) ↔ Ukrainian (`ukr_Cyrl`) translation. A slim FastAPI gateway (one Heroku dyno) serves the built React frontend and the API, and calls a Gradio ZeroGPU Space (`Danlike/NLLB-200-600-endpoint`, fine-tuned NLLB-200 600M) over HTTP. The gateway runs no model. The Space code lives on Hugging Face, not here. Comments, docstrings and UI strings are largely in Ukrainian.
+Bosnian (`bos_Latn`) ↔ Ukrainian (`ukr_Cyrl`) translation. A slim FastAPI gateway (one Heroku dyno) serves the built React frontend and the API, and calls a Gradio ZeroGPU Space (`Danlike/NLLB-200-600-endpoint`, fine-tuned NLLB-200 600M) over HTTP. The gateway runs no model. The Space code lives on Hugging Face, not here. UI strings, including the API's user-facing messages, are in English; many comments and docstrings are in Ukrainian.
 
 ## Commands
 

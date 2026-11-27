@@ -109,7 +109,7 @@ class JobQueue:
             return False
         if job.task:
             job.task.cancel()
-        job.finish(JobStatus.FAILED, error="Скасовано")
+        job.finish(JobStatus.FAILED, error="Cancelled")
         return True
 
     async def _run(self) -> None:

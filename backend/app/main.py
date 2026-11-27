@@ -67,7 +67,7 @@ def create_app(
             if not length.isdigit():
                 return JSONResponse({"detail": "Content-Length required"}, status_code=411)
             if int(length) > cfg.max_upload_bytes + _MULTIPART_OVERHEAD_BYTES:
-                return JSONResponse({"detail": "Файл завеликий"}, status_code=413)
+                return JSONResponse({"detail": "The file is too large"}, status_code=413)
         return await call_next(request)
 
     app.add_middleware(

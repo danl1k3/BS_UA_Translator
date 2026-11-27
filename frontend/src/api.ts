@@ -6,12 +6,12 @@ export async function apiFetch(path: string, init?: RequestInit): Promise<Respon
   if (!response.ok) {
     const body = await response.json().catch(() => null);
     throw new Error(
-      typeof body?.detail === 'string' ? body.detail : `Помилка сервера (${response.status})`,
+      typeof body?.detail === 'string' ? body.detail : `Server error (${response.status})`,
     );
   }
   return response;
 }
 
 export function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : 'Невідома помилка';
+  return error instanceof Error ? error.message : 'Unknown error';
 }

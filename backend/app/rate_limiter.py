@@ -193,7 +193,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
                 retry_after,
             )
             response: Response = JSONResponse(
-                {"detail": "Забагато запитів. Спробуйте пізніше."},
+                {"detail": "Too many requests. Try again in a minute."},
                 status_code=429,
                 headers={"Retry-After": str(int(retry_after) + 1)},
             )

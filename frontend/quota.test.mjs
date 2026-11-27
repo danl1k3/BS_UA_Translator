@@ -5,13 +5,13 @@ import { describeQuota } from './src/quota.ts';
 test('shows remaining and total GPU time', () => {
   assert.equal(
     describeQuota({ remaining_seconds: 205, total_seconds: 300, resets_at: null }),
-    'Ліміт GPU: залишилось 3 хв 25 с з 5 хв',
+    'GPU time left: 3 min 25 s of 5 min',
   );
 });
 
 test('handles less than a minute and an empty quota', () => {
   assert.equal(
     describeQuota({ remaining_seconds: 0, total_seconds: 210, resets_at: null }),
-    'Ліміт GPU: залишилось 0 с з 3 хв 30 с',
+    'GPU time left: 0 s of 3 min 30 s',
   );
 });

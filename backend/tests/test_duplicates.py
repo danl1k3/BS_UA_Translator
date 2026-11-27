@@ -23,7 +23,7 @@ def test_repeated_text_is_answered_without_calling_backend():
         first = translate(client)
         second = translate(client)
     assert "event: notice" not in first
-    assert "Цей текст уже перекладено" in second
+    assert "This text is already translated" in second
     assert "DOBAR DAN." in second
     assert len(backend.calls) == 1
 
@@ -67,9 +67,9 @@ def test_text_in_progress_is_not_sent_twice():
         second = translate(client)
         first.join()
         after = translate(client)
-    assert "Цей текст уже перекладається" in second
+    assert "This text is already being translated" in second
     assert "event: message" not in second
-    assert "Цей текст уже перекладено" in after
+    assert "This text is already translated" in after
     assert len(backend.calls) == 2
 
 

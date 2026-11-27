@@ -84,12 +84,12 @@ def _parse_docx(raw: bytes, source_lang: str) -> ParsedDocument:
     try:
         with zipfile.ZipFile(io.BytesIO(raw)) as archive:
             if sum(i.file_size for i in archive.infolist()) > MAX_DOCX_UNPACKED_BYTES:
-                raise DocumentError(413, "Документ завеликий")
+                raise DocumentError(413, "The document is too large")
         document = Document(io.BytesIO(raw))
     except DocumentError:
         raise
     except Exception as exc:
-        raise DocumentError(400, "Не вдалося прочитати файл .docx") from exc
+        raise DocumentError(400, "Could not read the .docx file") from exc
 
     paragraphs: list[list[Run]] = []
     for paragraph in document.paragraphs:
@@ -122,8 +122,8 @@ _PARSERS = {".txt": _parse_txt, ".html": _parse_html, ".htm": _parse_html, ".doc
 def parse_document(filename: str, raw: bytes, source_lang: str) -> ParsedDocument:
     parser = _PARSERS.get(os.path.splitext(filename.lower())[1])
     if parser is None:
-        raise DocumentError(415, "Непідтримуваний тип файлу")
+        raise DocumentError(415, "This file type is not supported")
     document = parser(raw, source_lang)
     if not any(text.strip() for text in document.texts):
-        raise DocumentError(400, "У файлі немає тексту для перекладу")
+        raise DocumentError(400, "The file has no text to translate")
     return document

@@ -17,19 +17,19 @@ from ..sanitize import clean_filename, clean_text
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-TEXT_DONE = "Цей текст уже перекладено."
-TEXT_RUNNING = "Цей текст уже перекладається. Зачекайте на результат."
+TEXT_DONE = "This text is already translated."
+TEXT_RUNNING = "This text is already being translated. Wait for the result."
 
 
 class TranslationRequest(BaseModel):
     text: str = Field(..., max_length=2000)
-    source_lang: str = Field("bos_Latn", description="Код мови оригіналу (наприклад, bos_Latn)")
-    target_lang: str = Field("ukr_Cyrl", description="Код цільової мови (наприклад, ukr_Cyrl)")
+    source_lang: str = Field("bos_Latn", description="Source language code, for example bos_Latn")
+    target_lang: str = Field("ukr_Cyrl", description="Target language code, for example ukr_Cyrl")
 
 
 def _check_languages(source_lang: str, target_lang: str) -> None:
     if (source_lang, target_lang) not in LANGUAGE_PAIRS:
-        raise HTTPException(status_code=400, detail="Непідтримувана пара мов")
+        raise HTTPException(status_code=400, detail="This language pair is not supported")
 
 
 @router.post("/translate/stream")
@@ -40,7 +40,7 @@ async def translate_stream(body: TranslationRequest, request: Request):
     """
     text = clean_text(body.text).strip()
     if not text:
-        raise HTTPException(status_code=400, detail="Текст порожній")
+        raise HTTPException(status_code=400, detail="The text is empty")
     _check_languages(body.source_lang, body.target_lang)
     backend = request.app.state.backend
     history = request.app.state.history
@@ -92,7 +92,7 @@ async def submit_file_job(
 
     raw = await upload_file.read(settings.max_upload_bytes + 1)
     if len(raw) > settings.max_upload_bytes:
-        raise HTTPException(status_code=413, detail="Файл завеликий")
+        raise HTTPException(status_code=413, detail="The file is too large")
 
     filename = clean_filename(upload_file.filename or "")
     try:
@@ -101,7 +101,7 @@ async def submit_file_job(
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
     if sum(map(len, document.texts)) > settings.max_file_chars:
         limit = settings.max_file_chars
-        raise HTTPException(status_code=413, detail=f"Забагато тексту (ліміт {limit} символів)")
+        raise HTTPException(status_code=413, detail=f"Too much text (the limit is {limit} characters)")
 
     async def work(progress):
         translated = await translate_texts(
@@ -122,7 +122,7 @@ async def submit_file_job(
         job = jobs.submit(work, f"{base}_translated{ext}", document.media_type, key)
     except QueueFullError as exc:
         raise HTTPException(
-            status_code=503, detail="Черга заповнена. Спробуйте пізніше."
+            status_code=503, detail="The queue is full. Try again later."
         ) from exc
     return {"job_id": job.job_id, "status": job.status, "duplicate": None}
 
