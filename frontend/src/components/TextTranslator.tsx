@@ -4,10 +4,11 @@ import type { useTranslate } from '../hooks/useTranslate';
 import type { InferenceStatus } from '../hooks/useHealth';
 import { errorMessage } from '../api';
 import FileUploader from './FileUploader';
+import Notice from './Notice';
 
 type Props = ReturnType<typeof useTranslate> & { inferenceStatus: InferenceStatus };
 
-export default function TextTranslator({ translate, output, isLoading, error: propError, clearOutput, inferenceStatus }: Props) {
+export default function TextTranslator({ translate, output, isLoading, error: propError, notice, clearOutput, inferenceStatus }: Props) {
   const [sourceText, setSourceText] = useState('');
   const [copied, setCopied] = useState(false);
   const [direction, setDirection] = useState('balkan_to_ua');
@@ -89,6 +90,12 @@ export default function TextTranslator({ translate, output, isLoading, error: pr
             <span>
               Модель прокидається після сну. Перший запит може зайняти 30–60 секунд.
             </span>
+          </div>
+        )}
+
+        {notice && (
+          <div className="px-4 pt-4">
+            <Notice message={notice} />
           </div>
         )}
 

@@ -9,6 +9,7 @@ export function useTranslate() {
   const [output, setOutput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const controllerRef = useRef<AbortController | null>(null);
 
   const translate = async (text: string, sourceLang: string, targetLang: string) => {
@@ -18,6 +19,7 @@ export function useTranslate() {
     setIsLoading(true);
     setOutput('');
     setError(null);
+    setNotice(null);
 
     const timeoutId = setTimeout(() => {
       controller.abort();
@@ -43,6 +45,7 @@ export function useTranslate() {
 
         for (const { event, data } of parsed.events) {
           if (event === 'message') setOutput(data);
+          if (event === 'notice') setNotice(data);
           if (event === 'error') {
             setError(data === 'Translation failed' ? 'Переклад не вдався. Спробуйте ще раз.' : data);
           }
@@ -56,5 +59,10 @@ export function useTranslate() {
     }
   };
 
-  return { translate, output, isLoading, error, clearOutput: () => setOutput('') };
+  const clearOutput = () => {
+    setOutput('');
+    setNotice(null);
+  };
+
+  return { translate, output, isLoading, error, notice, clearOutput };
 }

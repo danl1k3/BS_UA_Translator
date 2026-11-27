@@ -36,6 +36,7 @@ class Job:
     filename: str
     media_type: str
     work: Work | None
+    key: str | None = None
     status: JobStatus = JobStatus.PENDING
     progress_current: int = 0
     progress_total: int = 0
@@ -80,9 +81,17 @@ class JobQueue:
     async def join(self) -> None:
         await self._queue.join()
 
-    def submit(self, work: Work, filename: str, media_type: str) -> Job:
+    def find(self, key: str) -> Job | None:
+        """The waiting, running or successful job with this key. Failed jobs are retried."""
         self._cleanup()
-        job = Job(uuid.uuid4().hex, filename, media_type, work)
+        return next(
+            (j for j in self._jobs.values() if j.key == key and j.status != JobStatus.FAILED),
+            None,
+        )
+
+    def submit(self, work: Work, filename: str, media_type: str, key: str | None = None) -> Job:
+        self._cleanup()
+        job = Job(uuid.uuid4().hex, filename, media_type, work, key)
         try:
             self._queue.put_nowait(job)
         except asyncio.QueueFull as exc:

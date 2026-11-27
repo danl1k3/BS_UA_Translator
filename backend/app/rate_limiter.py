@@ -179,6 +179,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             session_id = _verify(raw_cookie, self.cookie_secret)
         if not session_id:
             session_id = uuid.uuid4().hex
+        request.state.visitor = session_id  # used to recognise repeated requests
 
         ip_allowed, ip_retry = self.ip_store.is_allowed(f"ip:{client_ip}")
         sess_allowed, sess_retry = self.session_store.is_allowed(f"sess:{session_id}")

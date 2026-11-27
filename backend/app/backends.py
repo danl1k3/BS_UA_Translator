@@ -37,6 +37,10 @@ class TranslatorBackend(ABC):
     async def check_health(self) -> dict[str, object]:
         """Return `status` and `reachable` of the inference service."""
 
+    async def get_quota(self) -> dict[str, object] | None:
+        """Return the remaining GPU quota, or None if the backend cannot tell."""
+        return None
+
 
 class GradioBackend(TranslatorBackend):
     """Client for the `/translate` endpoint of a Gradio (ZeroGPU) Space.
@@ -46,6 +50,8 @@ class GradioBackend(TranslatorBackend):
 
     API_PATH = "/gradio_api/call/translate"
     HEALTH_TTL_SECONDS = 30.0
+    QUOTA_URL = "https://huggingface.co/api/spaces/zero-gpu/quota"
+    QUOTA_TTL_SECONDS = 15.0
 
     def __init__(
         self,
@@ -61,6 +67,7 @@ class GradioBackend(TranslatorBackend):
         self.headers = {"Authorization": f"Bearer {api_token}"} if api_token else {}
         self.transport = transport
         self._health: tuple[float, dict[str, object]] | None = None
+        self._quota: tuple[float, dict[str, object] | None] | None = None
 
     def _client(self, timeout: httpx.Timeout) -> httpx.AsyncClient:
         return httpx.AsyncClient(
@@ -89,10 +96,39 @@ class GradioBackend(TranslatorBackend):
         self._health = (now, health)
         return health
 
+    async def get_quota(self) -> dict[str, object] | None:
+        """Quota of the token owner. Cached, so visitors cannot flood Hugging Face."""
+        if not self.headers:
+            return None
+        now = time.monotonic()
+        if self._quota and now - self._quota[0] < self.QUOTA_TTL_SECONDS:
+            return self._quota[1]
+        quota: dict[str, object] | None = None
+        try:
+            async with self._client(httpx.Timeout(3.0)) as client:
+                response = await client.get(self.QUOTA_URL)
+            response.raise_for_status()
+            data = response.json()
+            quota = {
+                "remaining_seconds": max(0, int(data["current"])),
+                "total_seconds": int(data["base"]),
+                "resets_at": data.get("resetsAt"),
+            }
+        except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
+            logger.warning("Could not read the GPU quota: %s", exc)
+        self._quota = (now, quota)
+        return quota
+
     async def translate(self, text: str, source_lang: str, target_lang: str) -> str:
         direction = LANGUAGE_PAIRS.get((source_lang, target_lang))
         if direction is None:
             raise TranslationError(f"Unsupported pair: {source_lang} -> {target_lang}")
+        try:
+            return await self._call_space(text, direction)
+        finally:
+            self._quota = None  # the call may have used GPU time
+
+    async def _call_space(self, text: str, direction: str) -> str:
         async with self._client(self.timeout) as client:
             submitted = await client.post(self.API_PATH, json={"data": [text, direction]})
             submitted.raise_for_status()

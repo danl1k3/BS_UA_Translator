@@ -24,6 +24,8 @@ flowchart LR
   - `TranslatorBackend` abstraction with `GradioBackend` calling the Space.
   - Batching that keeps requests within the model's token limit and saves GPU quota.
   - A simple in-process queue for file jobs (submit, poll, download, cancel).
+  - Input cleaning (control and invisible characters) and per-visitor repeat detection, so the same text or file is not translated twice.
+  - The remaining ZeroGPU quota of the token owner, shown on the page.
 - **Training & Conversion (`training/`)**: Scripts and requirements for fine-tuning NLLB-200, converting to CTranslate2 (`int8`), and evaluating BLEU/chrF++ scores.
 
 ---
@@ -61,7 +63,7 @@ npm ci --legacy-peer-deps
 npm run dev
 ```
 
-Vite proxies `/translate` and `/health` to `http://localhost:8000` by default (override with `VITE_PROXY_TARGET`).
+Vite proxies `/translate`, `/quota` and `/health` to `http://localhost:8000` by default (override with `VITE_PROXY_TARGET`).
 
 ### 3. Deploying to Heroku + Hugging Face Spaces
 
@@ -72,9 +74,10 @@ Vite proxies `/translate` and `/health` to `http://localhost:8000` by default (o
    heroku config:set -a <app-name> \
      REMOTE_INFERENCE_URL="https://danlike-nllb-200-600-endpoint.hf.space" \
      COOKIE_SECRET="$(openssl rand -hex 32)"
-   # add REMOTE_API_TOKEN in the dashboard (Settings -> Config Vars)
+   # add REMOTE_API_TOKEN in the dashboard (Settings -> Config Vars);
+   # a fine-grained token also needs the "read billing usage" permission to show the quota
    heroku git:remote -a <app-name>
-   git push heroku main
+   git push heroku main   # from another branch: git push heroku <branch>:main
    ```
 
 To host the frontend elsewhere instead, build it with `VITE_API_URL=<gateway URL> npm run build` and set `CORS_ORIGINS` on the gateway to its address.
@@ -86,8 +89,9 @@ To host the frontend elsewhere instead, build it with `VITE_API_URL=<gateway URL
 | Method | Endpoint | Description |
 | :--- | :--- | :--- |
 | `GET` | `/health` | Inference reachability and file queue length |
-| `POST` | `/translate/stream` | Stream text translation via Server-Sent Events (`text`, `source_lang`, `target_lang`) |
-| `POST` | `/translate/file/submit` | Queue a file (up to 3 MB and 20,000 characters) and return `job_id` |
+| `GET` | `/quota` | Remaining ZeroGPU quota in seconds, or `null` if it cannot be read |
+| `POST` | `/translate/stream` | Stream text translation via Server-Sent Events (`text`, `source_lang`, `target_lang`); `notice` marks a repeat |
+| `POST` | `/translate/file/submit` | Queue a file (up to 3 MB and 20,000 characters) and return `job_id`; `duplicate` marks a repeat |
 | `GET` | `/translate/file/status` | Job status and progress (`?job_id=...`) |
 | `GET` | `/translate/file/result` | Download the translated file (`?job_id=...`) |
 | `DELETE` | `/translate/file/job` | Cancel a queued or running job (`?job_id=...`) |
@@ -127,7 +131,7 @@ npm run build
 
 - **Cold Starts:** Free-tier Hugging Face Spaces sleep after inactivity; the first translation may take 30–60 seconds while the model loads.
 - **GPU Quota:** All visitors share the daily ZeroGPU quota of the token owner.
-- **In-Process State:** Rate-limit buckets, the file queue and results live in memory of a single gateway instance and are lost on restart.
+- **In-Process State:** Rate-limit buckets, the file queue, results and repeat detection live in memory of a single gateway instance and are lost on restart.
 - **Documents:** `.docx` translation covers body paragraphs only (not tables, headers or footers); `.html` output keeps paragraph text only.
 - **Sentence Splitting:** Regex-based; abbreviations may split mid-sentence. Sentences over 220 characters are cut at a clause or word boundary to fit the model, which can affect quality.
 - **Text Length:** `/translate/stream` requests are capped at 2000 characters; use file upload for longer documents.

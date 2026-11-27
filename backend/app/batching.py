@@ -8,6 +8,7 @@ import re
 from typing import Callable
 
 from .backends import TranslationError, TranslatorBackend
+from .sanitize import clean_text
 
 # Dense text (numbers, URLs) is about 2 characters per token with the NLLB tokenizer.
 MAX_SEGMENT_CHARS = 220
@@ -63,7 +64,7 @@ async def translate_texts(
     on_progress: Callable[[int, int], None] = lambda done, total: None,
 ) -> list[str]:
     """Translate several texts together, keeping their line breaks."""
-    layout = [[split_segments(line) for line in text.split("\n")] for text in texts]
+    layout = [[split_segments(line) for line in clean_text(t).split("\n")] for t in texts]
     batches = _batches([s for lines in layout for line in lines for s in line])
 
     translated: list[str] = []

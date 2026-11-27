@@ -2,6 +2,7 @@ import { useRef, useState } from 'react';
 import { Loader2, UploadCloud, FileText, CheckCircle2, AlertTriangle } from 'lucide-react';
 import { apiFetch, errorMessage } from '../api';
 import type { InferenceStatus } from '../hooks/useHealth';
+import Notice from './Notice';
 
 interface Props {
   sourceLang: string;
@@ -20,12 +21,22 @@ interface JobStatus {
 // Ті самі ліміти, що й у gateway.
 const MAX_FILE_BYTES = 3 * 1024 * 1024;
 const POLL_INTERVAL_MS = 2000;
+const DUPLICATE_NOTICES = {
+  processing: 'Цей файл уже перекладається. Показуємо прогрес.',
+  complete: 'Цей файл уже перекладено. Можна завантажити результат.',
+};
+
+interface Submitted {
+  job_id: string;
+  duplicate: keyof typeof DUPLICATE_NOTICES | null;
+}
 
 export default function FileUploader({ sourceLang, targetLang, inferenceStatus }: Props) {
   const [file, setFile] = useState<File | null>(null);
   const [job, setJob] = useState<(JobStatus & { id: string }) | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const controllerRef = useRef<AbortController | null>(null);
 
@@ -34,6 +45,7 @@ export default function FileUploader({ sourceLang, targetLang, inferenceStatus }
   const selectFile = (next: File | undefined) => {
     if (!next || busy) return;
     setJob(null);
+    setNotice(null);
     setError(next.size > MAX_FILE_BYTES ? 'Файл завеликий (ліміт 3 МБ).' : null);
     setFile(next.size > MAX_FILE_BYTES ? null : next);
   };
@@ -46,6 +58,7 @@ export default function FileUploader({ sourceLang, targetLang, inferenceStatus }
     controllerRef.current = controller;
     setBusy(true);
     setError(null);
+    setNotice(null);
     setJob(null);
 
     try {
@@ -57,7 +70,8 @@ export default function FileUploader({ sourceLang, targetLang, inferenceStatus }
         method: 'POST',
         body: form,
       });
-      const { job_id: id } = (await submitted.json()) as { job_id: string };
+      const { job_id: id, duplicate } = (await submitted.json()) as Submitted;
+      if (duplicate) setNotice(DUPLICATE_NOTICES[duplicate]);
 
       while (!signal.aborted) {
         const response = await apiFetch(`/translate/file/status?job_id=${id}`);
@@ -188,6 +202,12 @@ export default function FileUploader({ sourceLang, targetLang, inferenceStatus }
           />
         </div>
       </div>
+
+      {notice && (
+        <div className="mt-6">
+          <Notice message={notice} />
+        </div>
+      )}
 
       {error && (
         <div className="mt-6 flex items-center gap-2 bg-rose-50 p-4 rounded-2xl border border-rose-100 text-rose-700 text-sm font-semibold">

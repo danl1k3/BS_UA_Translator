@@ -9,6 +9,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .backends import GradioBackend, TranslatorBackend
 from .config import Settings
+from .history import TranslationHistory
 from .job_queue import JobQueue
 from .rate_limiter import RateLimitMiddleware
 from .routers.health import router as health_router
@@ -53,6 +54,9 @@ def create_app(
         result_ttl_seconds=cfg.result_ttl_seconds,
         max_stored=cfg.max_stored_results,
     )
+    app.state.history = TranslationHistory(
+        ttl_seconds=cfg.result_ttl_seconds, max_entries=cfg.max_stored_results
+    )
 
     # Middleware added later wraps the earlier ones.
     @app.middleware("http")
@@ -76,7 +80,8 @@ def create_app(
     async def forbid_caching_api(request: Request, call_next):
         """Translations and job states must not be stored by a CDN or a browser."""
         response = await call_next(request)
-        if request.url.path == "/health" or request.url.path.startswith("/translate/"):
+        path = request.url.path
+        if path in ("/health", "/quota") or path.startswith("/translate/"):
             response.headers["Cache-Control"] = "no-store"
         return response
 

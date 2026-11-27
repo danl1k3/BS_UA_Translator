@@ -9,11 +9,16 @@ from sse_starlette.sse import EventSourceResponse
 from ..backends import LANGUAGE_PAIRS, TranslationError
 from ..batching import translate_texts
 from ..documents import DocumentError, parse_document
+from ..history import content_key
 from ..http_utils import make_content_disposition_header
 from ..job_queue import Job, JobStatus, QueueFullError
+from ..sanitize import clean_filename, clean_text
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+TEXT_DONE = "Цей текст уже перекладено."
+TEXT_RUNNING = "Цей текст уже перекладається. Зачекайте на результат."
 
 
 class TranslationRequest(BaseModel):
@@ -29,26 +34,46 @@ def _check_languages(source_lang: str, target_lang: str) -> None:
 
 @router.post("/translate/stream")
 async def translate_stream(body: TranslationRequest, request: Request):
-    """Text translation over SSE; keep-alive pings are sent while the GPU works."""
-    if not body.text.strip():
+    """Text translation over SSE; keep-alive pings are sent while the GPU works.
+
+    A `notice` event tells the visitor that the same text is already done or running.
+    """
+    text = clean_text(body.text).strip()
+    if not text:
         raise HTTPException(status_code=400, detail="Текст порожній")
     _check_languages(body.source_lang, body.target_lang)
     backend = request.app.state.backend
+    history = request.app.state.history
+    direction = LANGUAGE_PAIRS[body.source_lang, body.target_lang]
+    key = content_key(request.state.visitor, direction, text.encode())
 
     # A client disconnect cancels this generator and with it the Space request.
     async def event_generator():
-        try:
-            result = await translate_texts(
-                backend, [body.text.strip()], body.source_lang, body.target_lang
-            )
-            yield {"event": "message", "data": result[0]}
+        result = history.result(key)
+        if result is not None:
+            yield {"event": "notice", "data": TEXT_DONE}
+        elif history.is_running(key):
+            yield {"event": "notice", "data": TEXT_RUNNING}
             yield {"event": "end", "data": "[DONE]"}
-        except TranslationError as exc:
-            logger.warning("Translation failed: %s", exc)
-            yield {"event": "error", "data": exc.public_message}
-        except Exception:
-            logger.exception("Translation failed")
-            yield {"event": "error", "data": TranslationError.public_message}
+            return
+        else:
+            try:
+                # Nothing is awaited between the check above and this mark
+                with history.running(key):
+                    [result] = await translate_texts(
+                        backend, [text], body.source_lang, body.target_lang
+                    )
+                    history.save(key, result)
+            except TranslationError as exc:
+                logger.warning("Translation failed: %s", exc)
+                yield {"event": "error", "data": exc.public_message}
+                return
+            except Exception:
+                logger.exception("Translation failed")
+                yield {"event": "error", "data": TranslationError.public_message}
+                return
+        yield {"event": "message", "data": result}
+        yield {"event": "end", "data": "[DONE]"}
 
     return EventSourceResponse(event_generator())
 
@@ -69,7 +94,7 @@ async def submit_file_job(
     if len(raw) > settings.max_upload_bytes:
         raise HTTPException(status_code=413, detail="Файл завеликий")
 
-    filename = upload_file.filename or ""
+    filename = clean_filename(upload_file.filename or "")
     try:
         document = await asyncio.to_thread(parse_document, filename, raw, source_lang)
     except DocumentError as exc:
@@ -85,13 +110,21 @@ async def submit_file_job(
         return await asyncio.to_thread(document.build, translated)
 
     base, ext = os.path.splitext(filename)
+    jobs = request.app.state.jobs
+    direction = LANGUAGE_PAIRS[source_lang, target_lang]
+    # The extension is part of the key: it decides how the same bytes are read
+    key = content_key(request.state.visitor, f"{direction}{ext.lower()}", raw)
+    job = jobs.find(key)
+    if job is not None:
+        duplicate = "complete" if job.status == JobStatus.COMPLETE else "processing"
+        return {"job_id": job.job_id, "status": job.status, "duplicate": duplicate}
     try:
-        job = request.app.state.jobs.submit(work, f"{base}_translated{ext}", document.media_type)
+        job = jobs.submit(work, f"{base}_translated{ext}", document.media_type, key)
     except QueueFullError as exc:
         raise HTTPException(
             status_code=503, detail="Черга заповнена. Спробуйте пізніше."
         ) from exc
-    return {"job_id": job.job_id, "status": job.status}
+    return {"job_id": job.job_id, "status": job.status, "duplicate": None}
 
 
 def _find_job(request: Request, job_id: str) -> Job:
